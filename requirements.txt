@@ -16,3 +16,5 @@ tqdm
 transformers
 safetensors
 tiktoken
+wandb
+evaluate
