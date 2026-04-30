@@ -7,7 +7,6 @@ from typing import List, Optional
 
 import torch
 import wandb
-from datasets import load_dataset
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -59,16 +58,10 @@ def _generate_solutions_llama(
 def run_codecontests_evaluation_for_llama_instruct(
     model,
     tokenizer,
-    test_dataset=None,
     seed: int = 42,
     model_label: str = "Llama3-8B-Instruct-baseline",
     layer_idx: int = -1,
     run_id=None,
-    max_new_tokens: int = 2000,
-    temperature: float = 0.2,
-    top_p: float = 0.95,
-    top_k: int = 50,
-    repetition_penalty: float = 1.05,
     results_root=None,
     display: bool = True,
     livecodebench_release: str = "release_v6",
@@ -92,73 +85,6 @@ def run_codecontests_evaluation_for_llama_instruct(
 
     all_results: dict = {}
     steer_mode = "none"
-
-    if test_dataset is not None:
-        print(f"\n{'='*60}")
-        print(f" code_contests test set  ({len(test_dataset)} problems)")
-        print(f"{'='*60}")
-
-        mode_label = f"{model_label}-{steer_mode}"
-        cc_dir = base_root / "code_contests" / mode_label
-        cc_dir.mkdir(parents=True, exist_ok=True)
-        out_path = cc_dir / f"l{layer_idx}-seed{seed}-{run_id}.jsonl"
-
-        print(f"\n[{steer_mode}] Generating solutions for code_contests test set ...")
-        rows = []
-        for i in tqdm(range(len(test_dataset)), desc=f"cc/{steer_mode}", disable=not display):
-            problem = test_dataset[i]
-            description = (problem.get("description") or "").strip()
-            if not description:
-                continue
-
-            prompt = _format_code_generation_prompt(
-                tokenizer,
-                description,
-                language="python",
-            )
-            raw_outputs = _generate_solutions_llama(
-                model,
-                tokenizer,
-                prompt,
-                device,
-                n_samples=1,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-            )
-            solution = raw_outputs[0]
-            extracted = _extract_code_from_output(solution)
-            rows.append(
-                {
-                    "problem_name": problem.get("name", f"problem_{i}"),
-                    "description_preview": description[:300],
-                    "raw_output": solution,
-                    "extracted_code": extracted,
-                    "cf_tags": problem.get("cf_tags", []),
-                    "cf_rating": problem.get("cf_rating", -1),
-                    "steer_mode": steer_mode,
-                    "steer_value": 0.0,
-                    "steer_topk": 0,
-                    "layer_idx": layer_idx,
-                    "seed": seed,
-                    "run_id": run_id,
-                }
-            )
-
-        with open(out_path, "w", encoding="utf-8") as f:
-            for row in rows:
-                f.write(json.dumps(row) + "\n")
-        print(f"  Saved {len(rows)} solutions -> {out_path}")
-
-        log_payload = {
-            "cc/none/solutions_written": len(rows),
-            "cc/none/output_path": str(out_path),
-        }
-        if wandb.run is not None:
-            wandb.log(log_payload)
-        all_results["cc/none"] = {"output_path": str(out_path)}
 
     print(f"\n{'='*60}")
     print(f" LiveCodeBench  (release={livecodebench_release}, n={lcb_n_samples}, T={lcb_temperature})")
@@ -258,23 +184,10 @@ def run_codecontests_evaluation_for_llama_instruct(
     return all_results
 
 
-def _default_filtered_code_contests_test():
-    raw_dataset = load_dataset("deepmind/code_contests")
-    test_dataset_raw = raw_dataset["test"]
-    from config import CODEFORCES_CONCEPT_SET_LOOKUP
-
-    def _has_valid_cf_tag(example):
-        tags = example["cf_tags"]
-        return any(tag in CODEFORCES_CONCEPT_SET_LOOKUP for tag in tags)
-
-    return test_dataset_raw.filter(_has_valid_cf_tag)
-
-
 def run_llama8b_instruct_baseline(
     seed: int = 42,
     model_label: str = "Llama3-8B-Instruct-baseline",
     run_id: Optional[str] = None,
-    test_dataset=None,
     results_root=None,
     display: bool = True,
     livecodebench_release: str = "release_v6",
@@ -300,13 +213,9 @@ def run_llama8b_instruct_baseline(
     ).to(device)
     model.eval()
 
-    if test_dataset is None:
-        test_dataset = _default_filtered_code_contests_test()
-
     return run_codecontests_evaluation_for_llama_instruct(
         model=model,
         tokenizer=tokenizer,
-        test_dataset=test_dataset,
         seed=seed,
         model_label=model_label,
         run_id=run_id,
