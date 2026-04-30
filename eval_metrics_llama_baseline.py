@@ -125,6 +125,7 @@ def run_codecontests_evaluation_for_llama_instruct(
             repetition_penalty=lcb_repetition_penalty,
         )
         extracted = [_extract_code_from_output(s) for s in raw_samples]
+        print(extracted)
         all_outputs.append(raw_samples)
         all_extracted.append(extracted)
 
