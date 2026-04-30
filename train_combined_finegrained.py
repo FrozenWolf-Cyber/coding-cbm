@@ -102,6 +102,11 @@ parser.add_argument("--residual_dim", type=int, default=768)
 parser.add_argument("--orthogonal_loss_weight", type=float, default=0)
 parser.add_argument("--residual_penalty_weight", type=float, default=0)
 parser.add_argument("--DEBUG", action='store_true', help="If set, use a smaller subset of data for quick debugging.")
+parser.add_argument(
+    "--debug",
+    action="store_true",
+    help="Debug mode: run only 2 epochs and 2 train steps/epoch, disable wandb logging, keep eval.",
+)
 parser.add_argument("--intervention_gen_loss", type=float, default=0.0)
 parser.add_argument("--no_detach_intervention", action='store_true', help="If set, do not detach unsup during intervention generation loss computation.")
 parser.add_argument(
@@ -320,11 +325,23 @@ if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
     set_seed(args.seed)
+    debug_mode = args.debug or args.DEBUG
 
-    wandb.init(project="coding-qa", name=f"finegrained-{args.dataset}-seed{args.seed}",
-               config=vars(args))
-    
-    run_name = wandb.run.id
+    use_wandb = not debug_mode
+    if use_wandb:
+        wandb.init(
+            project="coding-qa",
+            name=f"finegrained-{args.dataset}-seed{args.seed}",
+            config=vars(args),
+        )
+        run_name = wandb.run.id
+    else:
+        run_name = f"debug-{int(time.time())}"
+        print("Debug mode enabled: disabling wandb logging and limiting training to 2 epochs / 2 steps per epoch.")
+
+    def wandb_log(payload):
+        if use_wandb:
+            wandb.log(payload)
 
     # ─────────────────────────────────────────────────────────────
     # code_contests data loading (deepmind/code_contests via HuggingFace)
@@ -343,7 +360,7 @@ if __name__ == "__main__":
         test_dataset_raw = test_dataset_raw.select(range(min(args.max_test_samples, len(test_dataset_raw))))
 
     # DEBUG: small subset
-    if args.DEBUG:
+    if debug_mode:
         train_dataset_raw = train_dataset_raw.select(range(min(64, len(train_dataset_raw))))
         test_dataset_raw  = test_dataset_raw.select(range(min(32, len(test_dataset_raw))))
 
@@ -655,7 +672,7 @@ if __name__ == "__main__":
     total_params += cbl_params
     print(f"Total parameters: {total_params}")
     print(f"Trainable parameters: {trainable_params} = {trainable_params/total_params:.4f} of total")
-    wandb.log({"trainable_parameters": trainable_params, "trainable_ratio": trainable_params/total_params})
+    wandb_log({"trainable_parameters": trainable_params, "trainable_ratio": trainable_params/total_params})
     
     classifier = torch.nn.Linear(args.residual_dim, len(concept_set)).to(device)
     
@@ -684,7 +701,8 @@ if __name__ == "__main__":
 
     start = time.time()
     best_epoch = -1
-    epochs = args.num_epochs * args.epoch_multiplier
+    epochs = 2 if debug_mode else args.num_epochs * args.epoch_multiplier
+    debug_max_steps_per_epoch = 2
     for e in range(epochs):
         print("Epoch ", e+1, ":")
         preLM.train()
@@ -829,9 +847,9 @@ if __name__ == "__main__":
             
             log["epoch"] = e + 1
             log["batch"] = i + 1
-            wandb.log(log)
+            wandb_log(log)
             
-            if args.DEBUG and i >= 2:
+            if debug_mode and (i + 1) >= debug_max_steps_per_epoch:
                 break
             
             
@@ -840,7 +858,7 @@ if __name__ == "__main__":
             if len(training_losses[key]) > 0:
                 avg_metrics[key] = sum(training_losses[key]) / len(training_losses[key])
         print("Epoch ", e + 1, " training losses: ", avg_metrics)
-        wandb.log({f"avg_{k}": avg_metrics[k] for k in avg_metrics.keys()})
+        wandb_log({f"avg_{k}": avg_metrics[k] for k in avg_metrics.keys()})
 
         # Validation: concept-tag metrics + validation loss by epoch.
         preLM.eval()
@@ -989,7 +1007,7 @@ if __name__ == "__main__":
                 f"cos_cubed={val_topk['cosine_cubed']:.4f}, "
                 f"valid_loss={val_log['valid_loss']:.6f}"
             )
-            wandb.log(val_log)
+            wandb_log(val_log)
             avg_metrics.update(val_log)
 
         # Track and save best checkpoint by total averaged training objective.
@@ -1002,7 +1020,7 @@ if __name__ == "__main__":
             + args.residual_penalty_weight * float(avg_metrics.get("residual_penalty_loss", 0.0))
             + args.intervention_gen_loss * float(avg_metrics.get("intervention_gen_loss", 0.0))
         )
-        wandb.log({"avg_total_loss": avg_total_loss})
+        wandb_log({"avg_total_loss": avg_total_loss})
 
         print("save model")
         preLM.save_pretrained(prefix + model_name + "_epoch_" + str(e + 1))
@@ -1015,10 +1033,7 @@ if __name__ == "__main__":
             preLM.save_pretrained(prefix + model_name + "_best")
             torch.save(cbl.state_dict(), prefix + cbl_name + "_best.pt")
             print(f"New best checkpoint at epoch {best_epoch} (valid_loss={best_loss:.6f})")
-            wandb.log({"best_epoch": best_epoch, "best_valid_loss": best_loss})
-
-        if args.DEBUG:
-            break
+            wandb_log({"best_epoch": best_epoch, "best_valid_loss": best_loss})
 
     end = time.time()
     print("time of training CBM:", (end - start) / 3600, "hours")
@@ -1132,7 +1147,7 @@ if __name__ == "__main__":
                 repetition_penalty=args.code_repetition_penalty,
                 results_root=(args.code_results_root or None),
                 llama_vocab_weight=llama_vocab_weight,
-                display=not args.DEBUG,
+                display=not debug_mode,
                 # Steering
                 steer_modes=lcb_steer_modes,
                 steer_value=get_intervention_value(args.dataset),
