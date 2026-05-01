@@ -4,6 +4,7 @@ import argparse
 import gc
 import json
 import multiprocessing as mp
+import os
 import pickle
 from pathlib import Path
 from typing import List, Optional
@@ -11,6 +12,12 @@ from typing import List, Optional
 import torch
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Force-disable wandb globally for this script (and inherited worker processes)
+# because eval-only path uses multiprocessing and wandb atexit cleanup can crash
+# during interpreter shutdown in spawned workers.
+os.environ.setdefault("WANDB_DISABLED", "true")
+os.environ.setdefault("WANDB_MODE", "disabled")
 
 from eval_metrics import (
     _extract_code_from_output,
