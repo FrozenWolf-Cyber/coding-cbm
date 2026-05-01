@@ -4,29 +4,82 @@ import argparse
 import gc
 import json
 import multiprocessing as mp
-import os
 import pickle
+import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
+import numpy as np
 import torch
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Force-disable wandb globally for this script (and inherited worker processes)
-# because eval-only path uses multiprocessing and wandb atexit cleanup can crash
-# during interpreter shutdown in spawned workers.
-os.environ.setdefault("WANDB_DISABLED", "true")
-os.environ.setdefault("WANDB_MODE", "disabled")
-
-from eval_metrics import (
-    _extract_code_from_output,
-    _format_code_generation_prompt,
-    _import_lcb,
-    print_extracted_code_samples_preview,
-    set_seed,
+from shared_code_prompt import (
+    LCB_LLAMA3_INSTRUCT_MODEL_ID,
+    format_lcb_llama3_instruct_prompt,
 )
-from shared_code_prompt import LCB_LLAMA3_INSTRUCT_MODEL_ID
+
+
+def set_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+
+def _format_code_generation_prompt(
+    tokenizer,
+    problem_description: str,
+    starter_code: str = "",
+    language: str = "python",
+) -> str:
+    return format_lcb_llama3_instruct_prompt(
+        tokenizer=tokenizer,
+        problem_description=problem_description,
+        starter_code=starter_code,
+        language=language,
+    )
+
+
+def _extract_code_from_output(model_output: str) -> str:
+    lines = model_output.split("\n")
+    fence_lines = [i for i, l in enumerate(lines) if "```" in l]
+    if len(fence_lines) < 2:
+        return ""
+    return "\n".join(lines[fence_lines[-2] + 1 : fence_lines[-1]])
+
+
+def print_extracted_code_samples_preview(
+    heading: str,
+    extracted_codes: Sequence[str],
+    *,
+    preview_chars: int = 420,
+    sep_width: int = 60,
+) -> None:
+    sep = "=" * sep_width
+    print(f"\n{heading}")
+    for j, code in enumerate(extracted_codes):
+        if j > 0:
+            print(sep)
+        body = (code or "").strip()
+        if preview_chars > 0 and len(body) > preview_chars:
+            body = body[:preview_chars] + "\n  ... [truncated]"
+        if not body:
+            print(f"  [sample {j + 1}/{len(extracted_codes)}] extracted: (empty)")
+        else:
+            indented = "\n".join(f"  {ln}" for ln in body.split("\n"))
+            print(f"  [sample {j + 1}/{len(extracted_codes)}] extracted (start):\n{indented}")
+
+
+def _import_lcb():
+    lcb_path = str((Path(__file__).parent / "LiveCodeBench").resolve())
+    if lcb_path not in sys.path:
+        sys.path.insert(0, lcb_path)
+    from lcb_runner.benchmarks.code_generation import load_code_generation_dataset
+    from lcb_runner.evaluation.compute_code_generation_metrics import codegen_metrics
+    from lcb_runner.evaluation.pass_k_utils import extract_instance_results
+
+    return load_code_generation_dataset, codegen_metrics, extract_instance_results
 
 
 @torch.no_grad()
