@@ -203,6 +203,79 @@ def _generate_solutions(
     return outputs
 
 
+@torch.no_grad()
+def _generate_solutions_batched(
+    preLM,
+    cbl,
+    tokenizer,
+    prompts: List[str],
+    device: torch.device,
+    n_samples: int = 1,
+    intervenes: Optional[List[Optional[List[float]]]] = None,
+    keep_other_concepts: bool = False,
+    max_new_tokens: int = 2000,
+    temperature: float = 0.2,
+    top_p: float = 0.95,
+    top_k: int = 50,
+    repetition_penalty: float = 1.05,
+    llama_vocab_weight=None,
+) -> List[List[str]]:
+    """Generate completions for a batch of prompts in one GPU pass."""
+    if not prompts:
+        return []
+
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    try:
+        enc = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
+    finally:
+        tokenizer.padding_side = original_padding_side
+
+    prompt_width = enc["input_ids"].shape[1]
+    intervene_tensor = None
+    intervene_mask = None
+    if intervenes is not None and any(v is not None for v in intervenes):
+        concept_dim = cbl.concept_dim
+        dense_rows = []
+        mask_rows = []
+        for v in intervenes:
+            if v is None:
+                dense_rows.append([0.0] * concept_dim)
+                mask_rows.append(False)
+            else:
+                dense_rows.append([float(x) for x in v])
+                mask_rows.append(True)
+        intervene_tensor = torch.tensor(dense_rows, dtype=torch.float32, device=device)
+        intervene_mask = torch.tensor(mask_rows, dtype=torch.bool, device=device)
+
+    gen_ids, _ = cbl.generate_intervention_batch_parallel(
+        enc["input_ids"],
+        preLM,
+        attention_mask=enc["attention_mask"],
+        num_samples=n_samples,
+        interventions=intervene_tensor,
+        intervention_mask=intervene_mask,
+        length=max_new_tokens,
+        temp=temperature,
+        topk=top_k,
+        topp=top_p,
+        repetition_penalty=repetition_penalty,
+        keep_other_concepts=keep_other_concepts,
+        llama_vocab_weight=llama_vocab_weight,
+    )
+
+    num_prompts = len(prompts)
+    outputs: List[List[str]] = []
+    for i in range(num_prompts):
+        row_outputs: List[str] = []
+        base_idx = i * n_samples
+        for s_idx in range(n_samples):
+            completion = gen_ids[base_idx + s_idx, prompt_width:]
+            row_outputs.append(tokenizer.decode(completion, skip_special_tokens=True).strip())
+        outputs.append(row_outputs)
+    return outputs
+
+
 
 # ── LCB code extraction (mirrors lcb_runner/utils/extraction_utils.py) ────────
 
@@ -213,6 +286,29 @@ def _extract_code_from_output(model_output: str) -> str:
     if len(fence_lines) < 2:
         return ""
     return "\n".join(lines[fence_lines[-2] + 1 : fence_lines[-1]])
+
+
+def print_extracted_code_samples_preview(
+    heading: str,
+    extracted_codes: Sequence[str],
+    *,
+    preview_chars: int = 420,
+    sep_width: int = 60,
+) -> None:
+    """Log a heading and the start of each extracted code sample, with ``=====`` dividers."""
+    sep = "=" * sep_width
+    print(f"\n{heading}")
+    for j, code in enumerate(extracted_codes):
+        if j > 0:
+            print(sep)
+        body = (code or "").strip()
+        if preview_chars > 0 and len(body) > preview_chars:
+            body = body[:preview_chars] + "\n  ... [truncated]"
+        if not body:
+            print(f"  [sample {j + 1}/{len(extracted_codes)}] extracted: (empty)")
+        else:
+            indented = "\n".join(f"  {ln}" for ln in body.split("\n"))
+            print(f"  [sample {j + 1}/{len(extracted_codes)}] extracted (start):\n{indented}")
 
 
 # ── LCB import helper ─────────────────────────────────────────────────────────
@@ -238,7 +334,7 @@ def run_codecontests_evaluation_for_cbm(
     # code_contests test split (HF Dataset) — for internal metrics
     test_dataset=None,
     seed: int = 42,
-    batch_size: int = 4,          # kept for API compat, unused in generation
+    batch_size: int = 4,
     model_label: str = "CBM-Llama3-code_contests",
     layer_idx: int = -1,
     run_id=None,
@@ -255,7 +351,8 @@ def run_codecontests_evaluation_for_cbm(
     # Pass a list to run multiple modes in one call, each logged separately.
     # Valid values: "none" (unsteered baseline), "groundtruth" (CF-tag steering).
     steer_modes: Optional[List[str]] = None,
-    steer_value: float = 100.0,
+    steer_value: Optional[float] = None,
+    keep_other_concepts: bool = False,
     # ── LiveCodeBench ─────────────────────────────────────────────────────────
     livecodebench_release: str = "release_v6",
     # LCB generation uses n=10, temp=0.2 to match the leaderboard exactly.
@@ -268,6 +365,8 @@ def run_codecontests_evaluation_for_cbm(
     lcb_num_process_evaluate: int = 8,
     lcb_timeout: int = 6,
     livecodebench_split: str = "test",
+    print_extracted_code_preview: bool = False,
+    extracted_preview_chars: int = 420,
 ) -> dict:
     """Generate and evaluate code for both code_contests test set and LiveCodeBench.
 
@@ -290,6 +389,9 @@ def run_codecontests_evaluation_for_cbm(
     preLM.eval()
     cbl.eval()
     set_seed(seed)
+
+    if steer_value is None:
+        steer_value = float(get_intervention_value("code_contests"))
 
     if steer_modes is None:
         steer_modes = ["none"]
@@ -323,6 +425,53 @@ def run_codecontests_evaluation_for_cbm(
             rows = []
             concept_pred_rows = []
             concept_target_rows = []
+            prompt_batch_size = max(1, int(batch_size))
+            pending_prompts: List[str] = []
+            pending_intervenes: List[Optional[List[float]]] = []
+            pending_meta_rows: List[dict] = []
+
+            def _flush_cc_batch():
+                if not pending_prompts:
+                    return
+                generated = _generate_solutions_batched(
+                    preLM,
+                    cbl,
+                    tokenizer,
+                    pending_prompts,
+                    device,
+                    n_samples=1,
+                    intervenes=pending_intervenes,
+                    keep_other_concepts=keep_other_concepts,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    llama_vocab_weight=llama_vocab_weight,
+                )
+                for meta, outputs_for_prompt in zip(pending_meta_rows, generated):
+                    solution = outputs_for_prompt[0]
+                    extracted = _extract_code_from_output(solution)
+                    rows.append(
+                        {
+                            **meta,
+                            "raw_output": solution,
+                            "extracted_code": extracted,
+                        }
+                    )
+                    if print_extracted_code_preview:
+                        desc = meta.get("description_preview") or ""
+                        pname = meta.get("problem_name", "")
+                        print_extracted_code_samples_preview(
+                            f"[{steer_mode}] code_contests  problem={pname!r}  "
+                            f"description (start): {desc!r}",
+                            [extracted],
+                            preview_chars=extracted_preview_chars,
+                        )
+                pending_prompts.clear()
+                pending_intervenes.clear()
+                pending_meta_rows.clear()
+
             for i in tqdm(range(len(test_dataset)), desc=f"cc/{steer_mode}", disable=not display):
                 problem = test_dataset[i]
                 description = problem["description"].strip()
@@ -362,24 +511,11 @@ def run_codecontests_evaluation_for_cbm(
                     concept_pred_rows.append(pooled_eval_concepts)
                     concept_target_rows.append(target_multihot)
 
-                raw_outputs = _generate_solutions(
-                    preLM, cbl, tokenizer, prompt, device,
-                    n_samples=1,
-                    intervene=intervene,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    repetition_penalty=repetition_penalty,
-                    llama_vocab_weight=llama_vocab_weight,
-                )
-                solution = raw_outputs[0]
-                extracted = _extract_code_from_output(solution)
-                rows.append({
+                pending_prompts.append(prompt)
+                pending_intervenes.append(intervene)
+                pending_meta_rows.append({
                     "problem_name": problem.get("name", f"problem_{i}"),
                     "description_preview": description[:300],
-                    "raw_output": solution,
-                    "extracted_code": extracted,
                     "cf_tags": cf_tags,
                     "cf_rating": problem.get("cf_rating", -1),
                     "steer_mode": steer_mode,
@@ -389,6 +525,9 @@ def run_codecontests_evaluation_for_cbm(
                     "seed": seed,
                     "run_id": run_id,
                 })
+                if len(pending_prompts) >= prompt_batch_size:
+                    _flush_cc_batch()
+            _flush_cc_batch()
 
             with open(out_path, "w", encoding="utf-8") as f:
                 for row in rows:
@@ -462,6 +601,44 @@ def run_codecontests_evaluation_for_cbm(
         all_outputs: List[List[str]] = []
         all_extracted: List[List[str]] = []
         benchmark_sorted = sorted(benchmark, key=lambda x: x.question_id)
+        prompt_batch_size = max(1, int(batch_size))
+        pending_lcb_prompts: List[str] = []
+        pending_lcb_intervenes: List[Optional[List[float]]] = []
+        pending_lcb_headings: List[str] = []
+
+        def _flush_lcb_batch():
+            if not pending_lcb_prompts:
+                return
+            generated = _generate_solutions_batched(
+                preLM,
+                cbl,
+                tokenizer,
+                pending_lcb_prompts,
+                device,
+                n_samples=lcb_n_samples,
+                intervenes=pending_lcb_intervenes,
+                keep_other_concepts=keep_other_concepts,
+                max_new_tokens=lcb_max_new_tokens,
+                temperature=lcb_temperature,
+                top_p=lcb_top_p,
+                top_k=lcb_top_k,
+                repetition_penalty=lcb_repetition_penalty,
+                llama_vocab_weight=llama_vocab_weight,
+            )
+            for heading, raw_samples in zip(pending_lcb_headings, generated):
+                extracted = [_extract_code_from_output(s) for s in raw_samples]
+                if print_extracted_code_preview:
+                    print_extracted_code_samples_preview(
+                        heading,
+                        extracted,
+                        preview_chars=extracted_preview_chars,
+                    )
+                all_outputs.append(raw_samples)
+                all_extracted.append(extracted)
+            pending_lcb_prompts.clear()
+            pending_lcb_intervenes.clear()
+            pending_lcb_headings.clear()
+
         for problem in tqdm(benchmark_sorted, desc=f"lcb/{steer_mode}", disable=not display):
             text_for_steer = problem.question_content  # problem statement text
             problem_id = str(problem.question_id)
@@ -476,20 +653,17 @@ def run_codecontests_evaluation_for_cbm(
                 starter_code=getattr(problem, "starter_code", "") or "",
                 language="python",
             )
-            raw_samples = _generate_solutions(
-                preLM, cbl, tokenizer, prompt, device,
-                n_samples=lcb_n_samples,
-                intervene=intervene,
-                max_new_tokens=lcb_max_new_tokens,
-                temperature=lcb_temperature,
-                top_p=lcb_top_p,
-                top_k=lcb_top_k,
-                repetition_penalty=lcb_repetition_penalty,
-                llama_vocab_weight=llama_vocab_weight,
+            pending_lcb_prompts.append(prompt)
+            pending_lcb_intervenes.append(intervene)
+            desc_flat = problem.question_content.replace("\n", " ").strip()
+            desc_short = desc_flat[:260] + ("..." if len(desc_flat) > 260 else "")
+            pending_lcb_headings.append(
+                f"[{steer_mode}] LCB  question_id={problem.question_id}  "
+                f"description (start): {desc_short!r}"
             )
-            extracted = [_extract_code_from_output(s) for s in raw_samples]
-            all_outputs.append(raw_samples)
-            all_extracted.append(extracted)
+            if len(pending_lcb_prompts) >= prompt_batch_size:
+                _flush_lcb_batch()
+        _flush_lcb_batch()
         # Save in LCB canonical JSON format
         save_results = [
             problem.insert_output(outputs, codes)

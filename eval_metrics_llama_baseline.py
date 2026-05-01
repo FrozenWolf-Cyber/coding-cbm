@@ -10,7 +10,13 @@ import wandb
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from eval_metrics import _extract_code_from_output, _format_code_generation_prompt, _import_lcb, set_seed
+from eval_metrics import (
+    _extract_code_from_output,
+    _format_code_generation_prompt,
+    _import_lcb,
+    print_extracted_code_samples_preview,
+    set_seed,
+)
 from shared_code_prompt import LCB_LLAMA3_INSTRUCT_MODEL_ID
 
 
@@ -55,6 +61,58 @@ def _generate_solutions_llama(
     return outputs
 
 
+@torch.no_grad()
+def _generate_solutions_llama_batched(
+    model,
+    tokenizer,
+    prompts: List[str],
+    device: torch.device,
+    n_samples: int = 1,
+    max_new_tokens: int = 2000,
+    temperature: float = 0.2,
+    top_p: float = 0.95,
+    top_k: int = 50,
+    repetition_penalty: float = 1.05,
+) -> List[List[str]]:
+    if not prompts:
+        return []
+
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    try:
+        enc = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
+    finally:
+        tokenizer.padding_side = original_padding_side
+
+    prompt_width = enc["input_ids"].shape[1]
+    do_sample = temperature > 0
+    generation_kwargs = {
+        "input_ids": enc["input_ids"],
+        "attention_mask": enc["attention_mask"],
+        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
+        "temperature": temperature if do_sample else None,
+        "top_p": top_p if do_sample else None,
+        "top_k": top_k if do_sample else None,
+        "repetition_penalty": repetition_penalty,
+        "num_return_sequences": n_samples,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+    generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
+    gen_ids = model.generate(**generation_kwargs)
+
+    batch_outputs: List[List[str]] = []
+    for prompt_idx in range(len(prompts)):
+        row = []
+        base = prompt_idx * n_samples
+        for sample_idx in range(n_samples):
+            completion = gen_ids[base + sample_idx, prompt_width:]
+            row.append(tokenizer.decode(completion, skip_special_tokens=True).strip())
+        batch_outputs.append(row)
+    return batch_outputs
+
+
 def run_codecontests_evaluation_for_llama_instruct(
     model,
     tokenizer,
@@ -71,8 +129,11 @@ def run_codecontests_evaluation_for_llama_instruct(
     lcb_top_k: int = 50,
     lcb_max_new_tokens: int = 2000,
     lcb_repetition_penalty: float = 1.05,
+    lcb_prompt_batch_size: int = 4,
     lcb_num_process_evaluate: int = 8,
     lcb_timeout: int = 6,
+    print_extracted_code_preview: bool = False,
+    extracted_preview_chars: int = 420,
 ) -> dict:
     model.eval()
     set_seed(seed)
@@ -105,17 +166,16 @@ def run_codecontests_evaluation_for_llama_instruct(
     all_outputs: List[List[str]] = []
     all_extracted: List[List[str]] = []
     benchmark_sorted = sorted(benchmark, key=lambda x: x.question_id)
-    for problem in tqdm(benchmark_sorted, desc=f"lcb/{steer_mode}", disable=not display):
-        prompt = _format_code_generation_prompt(
-            tokenizer,
-            problem.question_content,
-            starter_code=getattr(problem, "starter_code", "") or "",
-            language="python",
-        )
-        raw_samples = _generate_solutions_llama(
+    pending_prompts: List[str] = []
+    pending_headings: List[str] = []
+
+    def _flush_batch():
+        if not pending_prompts:
+            return
+        generated = _generate_solutions_llama_batched(
             model,
             tokenizer,
-            prompt,
+            pending_prompts,
             device,
             n_samples=lcb_n_samples,
             max_new_tokens=lcb_max_new_tokens,
@@ -124,10 +184,36 @@ def run_codecontests_evaluation_for_llama_instruct(
             top_k=lcb_top_k,
             repetition_penalty=lcb_repetition_penalty,
         )
-        extracted = [_extract_code_from_output(s) for s in raw_samples]
-        print(extracted)
-        all_outputs.append(raw_samples)
-        all_extracted.append(extracted)
+        for heading, raw_samples in zip(pending_headings, generated):
+            extracted = [_extract_code_from_output(s) for s in raw_samples]
+            if print_extracted_code_preview:
+                print_extracted_code_samples_preview(
+                    heading,
+                    extracted,
+                    preview_chars=extracted_preview_chars,
+                )
+            all_outputs.append(raw_samples)
+            all_extracted.append(extracted)
+        pending_prompts.clear()
+        pending_headings.clear()
+
+    for problem in tqdm(benchmark_sorted, desc=f"lcb/{steer_mode}", disable=not display):
+        prompt = _format_code_generation_prompt(
+            tokenizer,
+            problem.question_content,
+            starter_code=getattr(problem, "starter_code", "") or "",
+            language="python",
+        )
+        pending_prompts.append(prompt)
+        desc_flat = problem.question_content.replace("\n", " ").strip()
+        desc_short = desc_flat[:260] + ("..." if len(desc_flat) > 260 else "")
+        pending_headings.append(
+            f"[{steer_mode}] LCB  question_id={problem.question_id}  "
+            f"description (start): {desc_short!r}"
+        )
+        if len(pending_prompts) >= max(1, int(lcb_prompt_batch_size)):
+            _flush_batch()
+    _flush_batch()
 
     save_results = [
         problem.insert_output(outputs, codes)
@@ -197,8 +283,11 @@ def run_llama8b_instruct_baseline(
     lcb_top_p: float = 0.95,
     lcb_top_k: int = 50,
     lcb_max_new_tokens: int = 2000,
+    lcb_prompt_batch_size: int = 4,
     lcb_num_process_evaluate: int = 8,
     lcb_timeout: int = 6,
+    print_extracted_code_preview: bool = False,
+    extracted_preview_chars: int = 420,
 ) -> dict:
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -228,8 +317,11 @@ def run_llama8b_instruct_baseline(
         lcb_top_p=lcb_top_p,
         lcb_top_k=lcb_top_k,
         lcb_max_new_tokens=lcb_max_new_tokens,
+        lcb_prompt_batch_size=lcb_prompt_batch_size,
         lcb_num_process_evaluate=lcb_num_process_evaluate,
         lcb_timeout=lcb_timeout,
+        print_extracted_code_preview=print_extracted_code_preview,
+        extracted_preview_chars=extracted_preview_chars,
     )
 
 
@@ -246,8 +338,20 @@ if __name__ == "__main__":
     parser.add_argument("--lcb_top_p", type=float, default=0.95)
     parser.add_argument("--lcb_top_k", type=int, default=50)
     parser.add_argument("--lcb_max_new_tokens", type=int, default=2000)
+    parser.add_argument("--lcb_prompt_batch_size", type=int, default=4)
     parser.add_argument("--lcb_num_process_evaluate", type=int, default=8)
     parser.add_argument("--lcb_timeout", type=int, default=6)
+    parser.add_argument(
+        "--print_extracted_code_preview",
+        action="store_true",
+        help="Print a short excerpt of extracted code per sample (===== between samples).",
+    )
+    parser.add_argument(
+        "--extracted_preview_chars",
+        type=int,
+        default=420,
+        help="Max chars of extracted code to print per sample (with eval_metrics_llama_baseline --print_extracted_code_preview).",
+    )
     parser.add_argument("--wandb_project", type=str, default="coding-qa")
     parser.add_argument(
         "--wandb_name",
@@ -283,8 +387,11 @@ if __name__ == "__main__":
             lcb_top_p=args.lcb_top_p,
             lcb_top_k=args.lcb_top_k,
             lcb_max_new_tokens=args.lcb_max_new_tokens,
+            lcb_prompt_batch_size=args.lcb_prompt_batch_size,
             lcb_num_process_evaluate=args.lcb_num_process_evaluate,
             lcb_timeout=args.lcb_timeout,
+            print_extracted_code_preview=args.print_extracted_code_preview,
+            extracted_preview_chars=args.extracted_preview_chars,
         )
         print(json.dumps(results, indent=2))
     finally:

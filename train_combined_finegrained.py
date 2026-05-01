@@ -281,6 +281,29 @@ parser.add_argument(
     default=6,
     help="Per-test-case timeout (seconds) for LCB grading.",
 )
+parser.add_argument(
+    "--lcb_prompt_batch_size",
+    type=int,
+    default=4,
+    help=(
+        "How many LCB prompts to generate in each GPU batched forward pass "
+        "(also used for batched code_contests generation; passed as batch_size to run_codecontests_evaluation_for_cbm)."
+    ),
+)
+parser.add_argument(
+    "--print_extracted_code_preview",
+    action="store_true",
+    help=(
+        "During final code contests + LCB evaluation, print a short excerpt of extracted code per "
+        "sample for each problem (separated by ===== between samples)."
+    ),
+)
+parser.add_argument(
+    "--extracted_preview_chars",
+    type=int,
+    default=420,
+    help="Max characters of extracted code to print per sample (with --print_extracted_code_preview).",
+)
 
 
 class ClassificationDataset(torch.utils.data.Dataset):
@@ -1135,6 +1158,7 @@ if __name__ == "__main__":
                 tokenizer=tokenizer,
                 concept_set=concept_set,
                 test_dataset=test_dataset,
+                batch_size=args.lcb_prompt_batch_size,
                 seed=args.seed,
                 model_label=f"CBM-Llama3-{args.dataset}",
                 layer_idx=best_epoch,
@@ -1151,6 +1175,7 @@ if __name__ == "__main__":
                 # Steering
                 steer_modes=lcb_steer_modes,
                 steer_value=get_intervention_value(args.dataset),
+                keep_other_concepts=args.intervention_keep_other_concepts,
                 # LiveCodeBench
                 livecodebench_release=args.livecodebench_release,
                 lcb_n_samples=args.lcb_n_samples,
@@ -1159,6 +1184,8 @@ if __name__ == "__main__":
                 lcb_max_new_tokens=args.lcb_max_new_tokens,
                 lcb_num_process_evaluate=args.lcb_num_process_evaluate,
                 lcb_timeout=args.lcb_timeout,
+                print_extracted_code_preview=args.print_extracted_code_preview,
+                extracted_preview_chars=args.extracted_preview_chars,
             )
         except Exception as code_eval_err:
             import traceback

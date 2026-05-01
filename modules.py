@@ -232,6 +232,98 @@ class CBL(nn.Module):
                 break
         return ids, self.relu(concepts) if concepts is not None else None
 
+    def generate_intervention_batch_parallel(
+        self,
+        ids,
+        preLM,
+        attention_mask,
+        num_samples=1,
+        interventions=None,
+        intervention_mask=None,
+        length=100,
+        temp=0.7,
+        topk=100,
+        topp=0.9,
+        repetition_penalty=1.5,
+        eos_token_id=128001,
+        keep_other_concepts: bool = False,
+        llama_vocab_weight=None,
+    ):
+        """Generate for batched prompts in parallel with optional per-row interventions."""
+        prompt_batch = ids.size(0)
+        if prompt_batch > 1 and num_samples > 1:
+            ids = ids.repeat_interleave(num_samples, dim=0).contiguous()
+            attention_mask = attention_mask.repeat_interleave(num_samples, dim=0).contiguous()
+        elif prompt_batch == 1 and num_samples > 1:
+            ids = ids.expand(num_samples, -1).contiguous()
+            attention_mask = attention_mask.expand(num_samples, -1).contiguous()
+        else:
+            ids = ids.contiguous()
+            attention_mask = attention_mask.contiguous()
+
+        total_batch = ids.size(0)
+        finished = torch.zeros(total_batch, dtype=torch.bool, device=ids.device)
+        past_key_values = None
+        concepts = None
+
+        row_intervene = None
+        row_apply_mask = None
+        if interventions is not None:
+            row_intervene = interventions.to(device=ids.device, dtype=torch.float32)
+            if row_intervene.size(0) == prompt_batch and num_samples > 1:
+                row_intervene = row_intervene.repeat_interleave(num_samples, dim=0)
+        if intervention_mask is not None:
+            row_apply_mask = intervention_mask.to(device=ids.device, dtype=torch.bool).view(-1)
+            if row_apply_mask.numel() == prompt_batch and num_samples > 1:
+                row_apply_mask = row_apply_mask.repeat_interleave(num_samples, dim=0)
+
+        for _ in range(length):
+            input_ids = ids[:, -1:] if past_key_values is not None else ids
+            outputs = preLM(
+                input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            features = outputs.last_hidden_state.float()
+            concepts = self.cbl(features)
+            unsup_features = self.unsup(features)
+
+            if row_intervene is not None:
+                iv = row_intervene.to(device=concepts.device, dtype=concepts.dtype).unsqueeze(1).expand_as(concepts)
+                if row_apply_mask is None:
+                    apply_mask = torch.ones((total_batch, 1, 1), dtype=torch.bool, device=concepts.device).expand_as(concepts)
+                else:
+                    apply_mask = row_apply_mask.view(-1, 1, 1).expand_as(concepts)
+                if keep_other_concepts:
+                    apply_mask = apply_mask & (row_intervene.to(device=concepts.device) != 0).unsqueeze(1).expand_as(concepts)
+                concepts = torch.where(apply_mask, iv, concepts)
+
+            logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
+            if llama_vocab_weight is not None:
+                llama_logits = F.linear(outputs.last_hidden_state.to(llama_vocab_weight.dtype), llama_vocab_weight)
+                logits = logits + llama_logits.to(dtype=logits.dtype)
+            for b in range(total_batch):
+                if not finished[b]:
+                    token_mask = attention_mask[b].bool()
+                    if token_mask.any():
+                        token_ids = ids[b][token_mask]
+                        score = logits[b, -1, token_ids].clone()
+                        score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+                        logits[b, -1, token_ids] = score
+            next_token_logits = logits[:, -1, :] / temp
+            filtered_logits = top_k_top_p_filtering_batched(next_token_logits.clone(), top_k=topk, top_p=topp)
+            next_token = _safe_multinomial_from_logits(filtered_logits)
+            next_token[finished] = eos_token_id
+            ids = torch.cat((ids, next_token), dim=-1)
+            attention_mask = torch.cat((attention_mask, torch.ones_like(next_token, dtype=attention_mask.dtype)), dim=-1)
+            if eos_token_id is not None:
+                finished = finished | (next_token.squeeze(-1) == eos_token_id)
+            if finished.all():
+                break
+        return ids, self.relu(concepts) if concepts is not None else None
+
     def generate_multi_concept_batch(
         self,
         ids,
@@ -436,6 +528,98 @@ class CBLResidual(nn.Module):
             next_token = _safe_multinomial_from_logits(filtered_logits)  # (B, 1)
             next_token[finished] = eos_token_id
             ids = torch.cat((ids, next_token), dim=-1)
+            if eos_token_id is not None:
+                finished = finished | (next_token.squeeze(-1) == eos_token_id)
+            if finished.all():
+                break
+        return ids, self.relu(concepts) if concepts is not None else None
+
+    def generate_intervention_batch_parallel(
+        self,
+        ids,
+        preLM,
+        attention_mask,
+        num_samples=1,
+        interventions=None,
+        intervention_mask=None,
+        length=100,
+        temp=0.7,
+        topk=100,
+        topp=0.9,
+        repetition_penalty=1.5,
+        eos_token_id=128001,
+        keep_other_concepts: bool = False,
+        llama_vocab_weight=None,
+    ):
+        """Generate for batched prompts in parallel with optional per-row interventions."""
+        prompt_batch = ids.size(0)
+        if prompt_batch > 1 and num_samples > 1:
+            ids = ids.repeat_interleave(num_samples, dim=0).contiguous()
+            attention_mask = attention_mask.repeat_interleave(num_samples, dim=0).contiguous()
+        elif prompt_batch == 1 and num_samples > 1:
+            ids = ids.expand(num_samples, -1).contiguous()
+            attention_mask = attention_mask.expand(num_samples, -1).contiguous()
+        else:
+            ids = ids.contiguous()
+            attention_mask = attention_mask.contiguous()
+
+        total_batch = ids.size(0)
+        finished = torch.zeros(total_batch, dtype=torch.bool, device=ids.device)
+        past_key_values = None
+        concepts = None
+
+        row_intervene = None
+        row_apply_mask = None
+        if interventions is not None:
+            row_intervene = interventions.to(device=ids.device, dtype=torch.float32)
+            if row_intervene.size(0) == prompt_batch and num_samples > 1:
+                row_intervene = row_intervene.repeat_interleave(num_samples, dim=0)
+        if intervention_mask is not None:
+            row_apply_mask = intervention_mask.to(device=ids.device, dtype=torch.bool).view(-1)
+            if row_apply_mask.numel() == prompt_batch and num_samples > 1:
+                row_apply_mask = row_apply_mask.repeat_interleave(num_samples, dim=0)
+
+        for _ in range(length):
+            input_ids = ids[:, -1:] if past_key_values is not None else ids
+            outputs = preLM(
+                input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            features = outputs.last_hidden_state.float()
+            concepts = self.cbl(features)
+            unsup_features = self.cbl_residual(features)
+
+            if row_intervene is not None:
+                iv = row_intervene.to(device=concepts.device, dtype=concepts.dtype).unsqueeze(1).expand_as(concepts)
+                if row_apply_mask is None:
+                    apply_mask = torch.ones((total_batch, 1, 1), dtype=torch.bool, device=concepts.device).expand_as(concepts)
+                else:
+                    apply_mask = row_apply_mask.view(-1, 1, 1).expand_as(concepts)
+                if keep_other_concepts:
+                    apply_mask = apply_mask & (row_intervene.to(device=concepts.device) != 0).unsqueeze(1).expand_as(concepts)
+                concepts = torch.where(apply_mask, iv, concepts)
+
+            logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
+            if llama_vocab_weight is not None:
+                llama_logits = F.linear(outputs.last_hidden_state.to(llama_vocab_weight.dtype), llama_vocab_weight)
+                logits = logits + llama_logits.to(dtype=logits.dtype)
+            for b in range(total_batch):
+                if not finished[b]:
+                    token_mask = attention_mask[b].bool()
+                    if token_mask.any():
+                        token_ids = ids[b][token_mask]
+                        score = logits[b, -1, token_ids].clone()
+                        score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+                        logits[b, -1, token_ids] = score
+            next_token_logits = logits[:, -1, :] / temp
+            filtered_logits = top_k_top_p_filtering_batched(next_token_logits.clone(), top_k=topk, top_p=topp)
+            next_token = _safe_multinomial_from_logits(filtered_logits)
+            next_token[finished] = eos_token_id
+            ids = torch.cat((ids, next_token), dim=-1)
+            attention_mask = torch.cat((attention_mask, torch.ones_like(next_token, dtype=attention_mask.dtype)), dim=-1)
             if eos_token_id is not None:
                 finished = finished | (next_token.squeeze(-1) == eos_token_id)
             if finished.all():
