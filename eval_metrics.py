@@ -1178,14 +1178,16 @@ def _llamacpp_build_raw_prompt(text: str, concepts: list[str]) -> str:
     im_end = "<|im_end|>"
     nl = "\n"
     system_text = (
-        "You are a strict classifier. "
-        "Output ONLY a single line containing exactly one label copied verbatim from OPTIONS. "
+        "You are a strict classifier for coding tasks. "
+        "Given generated code or a coding solution, output ONLY a single line containing exactly one algorithm "
+        "or concept name copied verbatim from OPTIONS. "
         "No explanation, no preamble, no bullets."
     )
     assistant_prefill = "<think>\n\n</think>\n\n"
     opts_block = "\n".join(f"- {c}" for c in concepts)
     user_text = (
-        "Choose the single closest label from OPTIONS for the GENERATED_TEXT.\n\n"
+        "From OPTIONS, pick the single algorithm or programming concept that best matches the approach, "
+        "technique, or topic reflected in GENERATED_TEXT (code, pseudocode, or solution text).\n\n"
         f"OPTIONS:\n{opts_block}\n\n"
         f"GENERATED_TEXT:\n{text}\n\n"
         "Answer (one label verbatim from OPTIONS, nothing else):"
