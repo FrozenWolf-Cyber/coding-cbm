@@ -85,7 +85,7 @@ parser.add_argument(
 
 parser.add_argument("--batch_size", type=int, default=4)
 parser.add_argument("--epoch_multiplier", type=int, default=1, help="Epoch multiplier to increase total training steps (for debugging).")
-parser.add_argument("--max_length", type=int, default=4096)
+parser.add_argument("--max_length", type=int, default=2048)
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument(
@@ -349,6 +349,52 @@ class ClassificationDataset(torch.utils.data.Dataset):
         return len(self.encoded_dataset)
 
 
+def _dynamic_padding_collate(batch):
+    batch_text, batch_sim = zip(*batch)
+    pad_id = tokenizer.pad_token_id
+    max_len = max(int(x["input_ids"].shape[0]) for x in batch_text)
+
+    input_ids = []
+    attention_mask = []
+    loss_mask = []
+    has_loss_mask = all("loss_mask" in x for x in batch_text)
+
+    for x in batch_text:
+        cur_len = int(x["input_ids"].shape[0])
+        pad_len = max_len - cur_len
+
+        if pad_len > 0:
+            ids = F.pad(x["input_ids"], (0, pad_len), value=pad_id)
+            attn = F.pad(x["attention_mask"], (0, pad_len), value=0)
+        else:
+            ids = x["input_ids"]
+            attn = x["attention_mask"]
+
+        input_ids.append(ids)
+        attention_mask.append(attn)
+
+        if has_loss_mask:
+            # loss_mask is aligned to shifted labels and has length seq_len - 1
+            lm_target_len = max_len - 1
+            cur_lm_len = int(x["loss_mask"].shape[0])
+            lm_pad_len = lm_target_len - cur_lm_len
+            if lm_pad_len > 0:
+                lm = F.pad(x["loss_mask"], (0, lm_pad_len), value=0)
+            else:
+                lm = x["loss_mask"][:lm_target_len]
+            loss_mask.append(lm)
+
+    out_text = {
+        "input_ids": torch.stack(input_ids, dim=0),
+        "attention_mask": torch.stack(attention_mask, dim=0),
+    }
+    if has_loss_mask:
+        out_text["loss_mask"] = torch.stack(loss_mask, dim=0)
+
+    out_sim = torch.stack(batch_sim, dim=0)
+    return out_text, out_sim
+
+
 def build_loaders(encoded_dataset, s, mode):
     dataset = ClassificationDataset(encoded_dataset, s)
     dataloader = torch.utils.data.DataLoader(
@@ -356,6 +402,7 @@ def build_loaders(encoded_dataset, s, mode):
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         shuffle=True if mode == "train" else False,
+        collate_fn=_dynamic_padding_collate,
     )
     return dataloader
 
@@ -512,6 +559,8 @@ if __name__ == "__main__":
         pick = int(rng.integers(low=0, high=len(py_candidates)))
         return py_candidates[pick]
 
+    train_token_lengths = []
+
     def _tok_train(batch, indices):
         descriptions = batch["description"]
         solutions_all = batch["solutions"]
@@ -553,10 +602,10 @@ if __name__ == "__main__":
             )
         enc = tokenizer(
             formatted,
-            padding="max_length",
             truncation=True,
             max_length=args.max_length,
         )
+        train_token_lengths.extend(len(ids) for ids in enc["input_ids"])
         loss_masks = []
         for attn_mask, assistant_start in zip(enc["attention_mask"], assistant_starts):
             # Shifted LM labels predict token i+1 from token i; supervise only assistant tokens.
@@ -610,7 +659,6 @@ if __name__ == "__main__":
             )
         enc = tokenizer(
             formatted,
-            padding="max_length",
             truncation=True,
             max_length=args.max_length,
         )
@@ -638,7 +686,6 @@ if __name__ == "__main__":
         ]
         return tokenizer(
             prompts,
-            padding="max_length",
             truncation=True,
             max_length=args.max_length,
         )
@@ -647,6 +694,15 @@ if __name__ == "__main__":
     encoded_train_dataset = train_dataset.map(_tok_train, batched=True, with_indices=True, batch_size=1024)
     encoded_valid_dataset = valid_dataset.map(_tok_valid, batched=True, with_indices=True, batch_size=1024)
     encoded_test_dataset = test_dataset.map(_tok_eval, batched=True, batch_size=1024)
+    if len(train_token_lengths) > 0:
+        train_len_arr = np.asarray(train_token_lengths, dtype=np.int32)
+        print(
+            "train token length stats | "
+            f"min: {int(train_len_arr.min())}, "
+            f"mean: {float(train_len_arr.mean()):.2f}, "
+            f"median: {float(np.median(train_len_arr)):.2f}, "
+            f"max: {int(train_len_arr.max())}"
+        )
     tokenization_elapsed = time.time() - tokenization_start
 
     # Keep only tensors (no label column in code_contests encoded datasets)
