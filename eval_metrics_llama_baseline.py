@@ -4,11 +4,11 @@ import argparse
 import gc
 import json
 import multiprocessing as mp
+import pickle
 from pathlib import Path
 from typing import List, Optional
 
 import torch
-import wandb
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -119,6 +119,181 @@ def _generate_solutions_llama_batched(
     return batch_outputs
 
 
+def _build_paths(model_label: str, run_name: str, n_samples: int, temperature: float) -> dict:
+    lcb_repo = Path(__file__).parent / "LiveCodeBench"
+    mode_repr = f"{model_label}-none"
+    out_dir = lcb_repo / "output" / mode_repr / str(run_name)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"codegeneration_{n_samples}_{temperature}"
+    return {
+        "out_dir": out_dir,
+        "output_json": out_dir / f"{stem}.json",
+        "eval_json": out_dir / f"{stem}_eval.json",
+        "eval_all_json": out_dir / f"{stem}_eval_all.json",
+        "generation_pickle": out_dir / f"{stem}.pkl",
+    }
+
+
+def generate_lcb_pickle(
+    seed: int = 42,
+    model_label: str = "Llama3-8B-Instruct-baseline",
+    run_name: str = "norun",
+    display: bool = True,
+    livecodebench_release: str = "release_v6",
+    lcb_n_samples: int = 10,
+    lcb_temperature: float = 0.2,
+    lcb_top_p: float = 0.95,
+    lcb_top_k: int = 50,
+    lcb_max_new_tokens: int = 2000,
+    lcb_repetition_penalty: float = 1.05,
+    lcb_prompt_batch_size: int = 4,
+    print_extracted_code_preview: bool = False,
+    extracted_preview_chars: int = 420,
+) -> dict:
+    set_seed(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(
+        LCB_LLAMA3_INSTRUCT_MODEL_ID,
+        torch_dtype=dtype,
+    ).to(device)
+    model.eval()
+
+    load_code_generation_dataset, _, _ = _import_lcb()
+    benchmark = load_code_generation_dataset(livecodebench_release)
+    benchmark_sorted = sorted(benchmark, key=lambda x: x.question_id)
+    paths = _build_paths(model_label, run_name, lcb_n_samples, lcb_temperature)
+
+    all_outputs: List[List[str]] = []
+    all_extracted: List[List[str]] = []
+    pending_prompts: List[str] = []
+    pending_headings: List[str] = []
+
+    def _flush_batch():
+        if not pending_prompts:
+            return
+        generated = _generate_solutions_llama_batched(
+            model,
+            tokenizer,
+            pending_prompts,
+            device,
+            n_samples=lcb_n_samples,
+            max_new_tokens=lcb_max_new_tokens,
+            temperature=lcb_temperature,
+            top_p=lcb_top_p,
+            top_k=lcb_top_k,
+            repetition_penalty=lcb_repetition_penalty,
+        )
+        for heading, raw_samples in zip(pending_headings, generated):
+            extracted = [_extract_code_from_output(s) for s in raw_samples]
+            if print_extracted_code_preview:
+                print_extracted_code_samples_preview(
+                    heading,
+                    extracted,
+                    preview_chars=extracted_preview_chars,
+                )
+            all_outputs.append(raw_samples)
+            all_extracted.append(extracted)
+        pending_prompts.clear()
+        pending_headings.clear()
+
+    for problem in tqdm(benchmark_sorted, desc="lcb/generate", disable=not display):
+        prompt = _format_code_generation_prompt(
+            tokenizer,
+            problem.question_content,
+            starter_code=getattr(problem, "starter_code", "") or "",
+            language="python",
+        )
+        pending_prompts.append(prompt)
+        desc_flat = problem.question_content.replace("\n", " ").strip()
+        desc_short = desc_flat[:260] + ("..." if len(desc_flat) > 260 else "")
+        pending_headings.append(f"LCB question_id={problem.question_id} desc={desc_short!r}")
+        if len(pending_prompts) >= max(1, int(lcb_prompt_batch_size)):
+            _flush_batch()
+    _flush_batch()
+
+    save_results = [
+        problem.insert_output(outputs, codes)
+        for problem, outputs, codes in zip(benchmark_sorted, all_outputs, all_extracted)
+    ]
+    with open(paths["output_json"], "w", encoding="utf-8") as f:
+        json.dump(save_results, f, indent=4)
+
+    payload = {
+        "release": livecodebench_release,
+        "n_samples": lcb_n_samples,
+        "temperature": lcb_temperature,
+        "question_ids": [p.question_id for p in benchmark_sorted],
+        "all_outputs": all_outputs,
+        "all_extracted": all_extracted,
+    }
+    with open(paths["generation_pickle"], "wb") as f:
+        pickle.dump(payload, f)
+
+    del model, tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    print(f"Saved generation JSON   -> {paths['output_json']}")
+    print(f"Saved generation pickle -> {paths['generation_pickle']}")
+    return {"generation_pickle": str(paths["generation_pickle"]), "output_json": str(paths["output_json"])}
+
+
+def evaluate_lcb_from_pickle(
+    generation_pickle: str,
+    model_label: str = "Llama3-8B-Instruct-baseline",
+    run_name: str = "norun",
+    lcb_num_process_evaluate: int = 4,
+    lcb_timeout: int = 6,
+) -> dict:
+    with open(generation_pickle, "rb") as f:
+        payload = pickle.load(f)
+
+    release = payload["release"]
+    n_samples = int(payload["n_samples"])
+    temperature = float(payload["temperature"])
+    all_outputs = payload["all_outputs"]
+    all_extracted = payload["all_extracted"]
+    saved_qids = payload["question_ids"]
+
+    load_code_generation_dataset, codegen_metrics, extract_instance_results = _import_lcb()
+    benchmark = load_code_generation_dataset(release)
+    benchmark_sorted = sorted(benchmark, key=lambda x: x.question_id)
+    qids = [p.question_id for p in benchmark_sorted]
+    if qids != saved_qids:
+        raise RuntimeError("Pickle question_ids mismatch. Regenerate pickle for this release.")
+
+    paths = _build_paths(model_label, run_name, n_samples, temperature)
+    print(f"Running pass@k grading ({lcb_num_process_evaluate} workers) from {generation_pickle} ...")
+    eval_samples = [p.get_evaluation_sample() for p in benchmark_sorted]
+    metrics, results_dict, metadatas = codegen_metrics(
+        eval_samples,
+        all_extracted,
+        num_process_evaluate=lcb_num_process_evaluate,
+        timeout=lcb_timeout,
+    )
+    graded = extract_instance_results(results_dict)
+    save_eval_results = [
+        p.insert_output_evaluation(o, c, g, metadata=m)
+        for p, o, c, g, m in zip(benchmark_sorted, all_outputs, all_extracted, graded, metadatas)
+    ]
+    with open(paths["eval_all_json"], "w", encoding="utf-8") as f:
+        json.dump(save_eval_results, f, indent=4)
+    with open(paths["eval_json"], "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=4)
+
+    pass1 = metrics.get("pass@1", float("nan")) if isinstance(metrics, dict) else float("nan")
+    pass5 = metrics.get("pass@5", float("nan")) if isinstance(metrics, dict) else float("nan")
+    print(f"LCB pass@1 = {pass1:.4f} | pass@5 = {pass5:.4f}")
+    print(f"Saved LCB eval -> {paths['eval_all_json']}")
+    return {"pass@1": pass1, "pass@5": pass5, "eval_all_path": str(paths["eval_all_json"])}
+
+
 def run_codecontests_evaluation_for_llama_instruct(
     model=None,
     tokenizer=None,
@@ -172,7 +347,7 @@ def run_codecontests_evaluation_for_llama_instruct(
 
     lcb_repo = Path(__file__).parent / "LiveCodeBench"
     if run_id is None:
-        run_id = wandb.run.id if wandb.run is not None else "norun"
+        run_id = "norun"
     base_root = Path(results_root) if results_root else Path(__file__).parent / "results"
 
     all_results: dict = {}
@@ -291,18 +466,6 @@ def run_codecontests_evaluation_for_llama_instruct(
     print(f"\n  [none] LCB pass@1 = {pass1:.4f}  |  pass@5 = {pass5:.4f}")
     print(f"  model_repr : {mode_repr}")
     print(f"  eval_all   : {lcb_eval_all_path}")
-    log_payload = {
-        "lcb/none/pass@1": pass1,
-        "lcb/none/pass@5": pass5,
-        "lcb/none/n_samples": lcb_n_samples,
-        "lcb/none/temperature": lcb_temperature,
-        "lcb/none/steer_value": 0.0,
-        "lcb/none/steer_topk": 0,
-        "lcb/none/release": livecodebench_release,
-        "lcb/none/output_path": str(lcb_out_path),
-    }
-    if wandb.run is not None:
-        wandb.log(log_payload)
     all_results["lcb/none"] = {
         "pass@1": pass1,
         "pass@5": pass5,
@@ -362,71 +525,76 @@ if __name__ == "__main__":
         pass
 
     parser = argparse.ArgumentParser(
-        description="Run pure Llama-3-8B-Instruct baseline on code_contests + LiveCodeBench."
+        description="LCB baseline split: generate pickle first, evaluate later."
     )
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--model_label", type=str, default="Llama3-8B-Instruct-baseline")
-    parser.add_argument("--results_root", type=str, default=None)
-    parser.add_argument("--livecodebench_release", type=str, default="release_v6")
-    parser.add_argument("--lcb_n_samples", type=int, default=10)
-    parser.add_argument("--lcb_temperature", type=float, default=0.2)
-    parser.add_argument("--lcb_top_p", type=float, default=0.95)
-    parser.add_argument("--lcb_top_k", type=int, default=50)
-    parser.add_argument("--lcb_max_new_tokens", type=int, default=2000)
-    parser.add_argument("--lcb_prompt_batch_size", type=int, default=4)
-    parser.add_argument(
-        "--lcb_num_process_evaluate",
-        type=int,
-        default=4,
-        help="Parallel LCB grading workers (each task also spawns short-lived helper processes). "
-        "Lower if the host OOMs during eval (try 2 on ~64Gi RAM with the model still in memory elsewhere).",
-    )
-    parser.add_argument("--lcb_timeout", type=int, default=6)
-    parser.add_argument(
-        "--keep_model_loaded_for_grading",
-        action="store_true",
-        help="Skip unloading the LLM before pass@k grading (uses more RAM; only for debugging).",
-    )
-    parser.add_argument(
-        "--print_extracted_code_preview",
-        action="store_true",
-        help="Print a short excerpt of extracted code per sample (===== between samples).",
-    )
-    parser.add_argument(
-        "--extracted_preview_chars",
-        type=int,
-        default=420,
-        help="Max chars of extracted code to print per sample (with eval_metrics_llama_baseline --print_extracted_code_preview).",
-    )
-    parser.add_argument("--wandb_project", type=str, default="coding-qa")
-    parser.add_argument(
-        "--wandb_name",
-        type=str,
-        default=None,
-        help="Optional explicit W&B run name. Defaults to llama8b-baseline-{release}-seed{seed}.",
-    )
-    parser.add_argument(
-        "--disable_wandb",
-        action="store_true",
-        help="Disable W&B logging and run offline.",
-    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    p_gen = subparsers.add_parser("generate", help="Run only generation and save pickle/json.")
+    p_gen.add_argument("--seed", type=int, default=42)
+    p_gen.add_argument("--model_label", type=str, default="Llama3-8B-Instruct-baseline")
+    p_gen.add_argument("--run_name", type=str, default="norun")
+    p_gen.add_argument("--livecodebench_release", type=str, default="release_v6")
+    p_gen.add_argument("--lcb_n_samples", type=int, default=10)
+    p_gen.add_argument("--lcb_temperature", type=float, default=0.2)
+    p_gen.add_argument("--lcb_top_p", type=float, default=0.95)
+    p_gen.add_argument("--lcb_top_k", type=int, default=50)
+    p_gen.add_argument("--lcb_max_new_tokens", type=int, default=2000)
+    p_gen.add_argument("--lcb_prompt_batch_size", type=int, default=4)
+    p_gen.add_argument("--print_extracted_code_preview", action="store_true")
+    p_gen.add_argument("--extracted_preview_chars", type=int, default=420)
+
+    p_eval = subparsers.add_parser("evaluate", help="Run only evaluation from saved pickle.")
+    p_eval.add_argument("--generation_pickle", type=str, required=True)
+    p_eval.add_argument("--model_label", type=str, default="Llama3-8B-Instruct-baseline")
+    p_eval.add_argument("--run_name", type=str, default="norun")
+    p_eval.add_argument("--lcb_num_process_evaluate", type=int, default=4)
+    p_eval.add_argument("--lcb_timeout", type=int, default=6)
+
+    p_all = subparsers.add_parser("all", help="Run generation then evaluation.")
+    p_all.add_argument("--seed", type=int, default=42)
+    p_all.add_argument("--model_label", type=str, default="Llama3-8B-Instruct-baseline")
+    p_all.add_argument("--run_name", type=str, default="norun")
+    p_all.add_argument("--livecodebench_release", type=str, default="release_v6")
+    p_all.add_argument("--lcb_n_samples", type=int, default=10)
+    p_all.add_argument("--lcb_temperature", type=float, default=0.2)
+    p_all.add_argument("--lcb_top_p", type=float, default=0.95)
+    p_all.add_argument("--lcb_top_k", type=int, default=50)
+    p_all.add_argument("--lcb_max_new_tokens", type=int, default=2000)
+    p_all.add_argument("--lcb_prompt_batch_size", type=int, default=4)
+    p_all.add_argument("--lcb_num_process_evaluate", type=int, default=4)
+    p_all.add_argument("--lcb_timeout", type=int, default=6)
+    p_all.add_argument("--print_extracted_code_preview", action="store_true")
+    p_all.add_argument("--extracted_preview_chars", type=int, default=420)
+
     args = parser.parse_args()
-
-    run = None
-    if not args.disable_wandb:
-        run_name = args.wandb_name or f"llama8b-baseline-{args.livecodebench_release}-seed{args.seed}"
-        run = wandb.init(
-            project=args.wandb_project,
-            name=run_name,
-            config=vars(args),
-        )
-
-    try:
-        results = run_llama8b_instruct_baseline(
+    if args.command == "generate":
+        results = generate_lcb_pickle(
             seed=args.seed,
             model_label=args.model_label,
-            run_id=(run.id if run is not None else None),
-            results_root=args.results_root,
+            run_name=args.run_name,
+            livecodebench_release=args.livecodebench_release,
+            lcb_n_samples=args.lcb_n_samples,
+            lcb_temperature=args.lcb_temperature,
+            lcb_top_p=args.lcb_top_p,
+            lcb_top_k=args.lcb_top_k,
+            lcb_max_new_tokens=args.lcb_max_new_tokens,
+            lcb_prompt_batch_size=args.lcb_prompt_batch_size,
+            print_extracted_code_preview=args.print_extracted_code_preview,
+            extracted_preview_chars=args.extracted_preview_chars,
+        )
+    elif args.command == "evaluate":
+        results = evaluate_lcb_from_pickle(
+            generation_pickle=args.generation_pickle,
+            model_label=args.model_label,
+            run_name=args.run_name,
+            lcb_num_process_evaluate=args.lcb_num_process_evaluate,
+            lcb_timeout=args.lcb_timeout,
+        )
+    else:
+        results = run_codecontests_evaluation_for_llama_instruct(
+            seed=args.seed,
+            model_label=args.model_label,
+            run_id=args.run_name,
             livecodebench_release=args.livecodebench_release,
             lcb_n_samples=args.lcb_n_samples,
             lcb_temperature=args.lcb_temperature,
@@ -438,9 +606,5 @@ if __name__ == "__main__":
             lcb_timeout=args.lcb_timeout,
             print_extracted_code_preview=args.print_extracted_code_preview,
             extracted_preview_chars=args.extracted_preview_chars,
-            unload_model_before_grading=not args.keep_model_loaded_for_grading,
         )
-        print(json.dumps(results, indent=2))
-    finally:
-        if run is not None:
-            wandb.finish()
+    print(json.dumps(results, indent=2))
