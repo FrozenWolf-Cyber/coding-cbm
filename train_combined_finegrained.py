@@ -392,6 +392,7 @@ if __name__ == "__main__":
     # ─────────────────────────────────────────────────────────────
     # code_contests data loading (deepmind/code_contests via HuggingFace)
     # ─────────────────────────────────────────────────────────────
+    data_loading_start = time.time()
     print("loading code_contests dataset from HuggingFace...")
     raw_dataset = load_dataset("deepmind/code_contests")
     train_dataset_raw = raw_dataset["train"]
@@ -423,11 +424,13 @@ if __name__ == "__main__":
         return any(lang in (1, 3) and isinstance(sol, str) and sol.strip() for lang, sol in zip(languages, texts))
 
     # Keep only rows with at least one allowed CF tag.
+    filter_start = time.time()
     train_dataset_raw = train_dataset_raw.filter(_has_valid_cf_tag)
     valid_dataset_raw = valid_dataset_raw.filter(_has_valid_cf_tag)
     test_dataset_raw = test_dataset_raw.filter(_has_valid_cf_tag)
     # For training LM targets, drop rows without Python reference solutions.
     train_dataset_raw = train_dataset_raw.filter(_has_python_solution)
+    filter_elapsed = time.time() - filter_start
 
     print(
         f"filtered dataset lengths | train: {len(train_dataset_raw)}, "
@@ -640,9 +643,11 @@ if __name__ == "__main__":
             max_length=args.max_length,
         )
 
+    tokenization_start = time.time()
     encoded_train_dataset = train_dataset.map(_tok_train, batched=True, with_indices=True, batch_size=1024)
     encoded_valid_dataset = valid_dataset.map(_tok_valid, batched=True, with_indices=True, batch_size=1024)
     encoded_test_dataset = test_dataset.map(_tok_eval, batched=True, batch_size=1024)
+    tokenization_elapsed = time.time() - tokenization_start
 
     # Keep only tensors (no label column in code_contests encoded datasets)
     keep_cols_train = {"input_ids", "attention_mask", "loss_mask"}
@@ -678,6 +683,7 @@ if __name__ == "__main__":
     # concept_set labels come directly from CF tags (no class-based masking needed).
 
     print("creating loader...")
+    loader_start = time.time()
     train_loader = build_loaders(encoded_train_dataset, train_similarity, mode="train")
     valid_loader = build_loaders(encoded_valid_dataset, val_similarity, mode="valid")
 
@@ -685,6 +691,15 @@ if __name__ == "__main__":
     # Supervision is multi-hot from CF tags (already built as test_similarity_for_eval).
     test_dummy_sim = np.zeros((len(encoded_test_dataset), len(concept_set)), dtype=np.float32)
     test_loader = build_loaders(encoded_test_dataset, test_dummy_sim, mode="test")
+    loader_elapsed = time.time() - loader_start
+    data_loading_elapsed = time.time() - data_loading_start
+    print(
+        "data loading timings (sec) | "
+        f"filter: {filter_elapsed:.2f}, "
+        f"tokenize: {tokenization_elapsed:.2f}, "
+        f"dataloader: {loader_elapsed:.2f}, "
+        f"total: {data_loading_elapsed:.2f}"
+    )
 
     print("preparing backbone")
     preLM = LlamaModel.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID, torch_dtype=torch.bfloat16).to(device)
@@ -773,6 +788,19 @@ if __name__ == "__main__":
             if "loss_mask" in batch:
                 ignore = torch.full_like(word_label, -100)
                 word_label = torch.where(batch["loss_mask"] > 0, word_label, ignore)
+            if debug_mode:
+                print(
+                    f"[debug][train][epoch {e+1} step {i+1}] pre-preLM "
+                    f"input_ids={tuple(batch['input_ids'].shape)} "
+                    f"attention_mask={tuple(batch['attention_mask'].shape)} "
+                    f"batch_sim={tuple(batch_sim.shape)} "
+                    f"word_label={tuple(word_label.shape)}"
+                )
+                if "loss_mask" in batch:
+                    print(
+                        f"[debug][train][epoch {e+1} step {i+1}] pre-preLM "
+                        f"loss_mask={tuple(batch['loss_mask'].shape)}"
+                    )
             features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
             llama_logits = F.linear(features, llama_vocab_weight) if llama_vocab_weight is not None else None
             concepts, unsup, vocabs, matched_unsup = cbl(features.float(), llama_logits=llama_logits)
