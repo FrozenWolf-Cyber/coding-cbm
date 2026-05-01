@@ -210,6 +210,9 @@ def generate_lcb_pickle(
     print_extracted_code_preview: bool = False,
     extracted_preview_chars: int = 420,
 ) -> dict:
+    # ═════════════════════════════════════════════════════════════════════════
+    # 2. LiveCodeBench  (n_samples per problem, generation-only stage)
+    # ═════════════════════════════════════════════════════════════════════════
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID)
@@ -222,23 +225,30 @@ def generate_lcb_pickle(
     ).to(device)
     model.eval()
 
+    print(f"\n{'='*60}")
+    print(f" LiveCodeBench  (release={livecodebench_release}, n={lcb_n_samples}, T={lcb_temperature})")
+    print(f"{'='*60}")
     load_code_generation_dataset, _, _ = _import_lcb()
     benchmark = load_code_generation_dataset(livecodebench_release)
+    print(f"  Loaded {len(benchmark)} LCB problems")
     benchmark_sorted = sorted(benchmark, key=lambda x: x.question_id)
     paths = _build_paths(model_label, run_name, lcb_n_samples, lcb_temperature)
 
+    steer_mode = "none"
+    print(f"\n[{steer_mode}] Generating {lcb_n_samples} solutions × {len(benchmark)} LCB problems ...")
     all_outputs: List[List[str]] = []
     all_extracted: List[List[str]] = []
-    pending_prompts: List[str] = []
-    pending_headings: List[str] = []
+    prompt_batch_size = max(1, int(lcb_prompt_batch_size))
+    pending_lcb_prompts: List[str] = []
+    pending_lcb_headings: List[str] = []
 
-    def _flush_batch():
-        if not pending_prompts:
+    def _flush_lcb_batch():
+        if not pending_lcb_prompts:
             return
         generated = _generate_solutions_llama_batched(
             model,
             tokenizer,
-            pending_prompts,
+            pending_lcb_prompts,
             device,
             n_samples=lcb_n_samples,
             max_new_tokens=lcb_max_new_tokens,
@@ -247,7 +257,7 @@ def generate_lcb_pickle(
             top_k=lcb_top_k,
             repetition_penalty=lcb_repetition_penalty,
         )
-        for heading, raw_samples in zip(pending_headings, generated):
+        for heading, raw_samples in zip(pending_lcb_headings, generated):
             extracted = [_extract_code_from_output(s) for s in raw_samples]
             if print_extracted_code_preview:
                 print_extracted_code_samples_preview(
@@ -257,23 +267,26 @@ def generate_lcb_pickle(
                 )
             all_outputs.append(raw_samples)
             all_extracted.append(extracted)
-        pending_prompts.clear()
-        pending_headings.clear()
+        pending_lcb_prompts.clear()
+        pending_lcb_headings.clear()
 
-    for problem in tqdm(benchmark_sorted, desc="lcb/generate", disable=not display):
+    for problem in tqdm(benchmark_sorted, desc=f"lcb/{steer_mode}", disable=not display):
         prompt = _format_code_generation_prompt(
             tokenizer,
             problem.question_content,
             starter_code=getattr(problem, "starter_code", "") or "",
             language="python",
         )
-        pending_prompts.append(prompt)
+        pending_lcb_prompts.append(prompt)
         desc_flat = problem.question_content.replace("\n", " ").strip()
         desc_short = desc_flat[:260] + ("..." if len(desc_flat) > 260 else "")
-        pending_headings.append(f"LCB question_id={problem.question_id} desc={desc_short!r}")
-        if len(pending_prompts) >= max(1, int(lcb_prompt_batch_size)):
-            _flush_batch()
-    _flush_batch()
+        pending_lcb_headings.append(
+            f"[{steer_mode}] LCB  question_id={problem.question_id}  "
+            f"description (start): {desc_short!r}"
+        )
+        if len(pending_lcb_prompts) >= prompt_batch_size:
+            _flush_lcb_batch()
+    _flush_lcb_batch()
 
     save_results = [
         problem.insert_output(outputs, codes)
@@ -299,9 +312,15 @@ def generate_lcb_pickle(
         torch.cuda.empty_cache()
         gc.collect()
 
-    print(f"Saved generation JSON   -> {paths['output_json']}")
-    print(f"Saved generation pickle -> {paths['generation_pickle']}")
-    return {"generation_pickle": str(paths["generation_pickle"]), "output_json": str(paths["output_json"])}
+    print(f"  Saved LCB outputs → {paths['output_json']}")
+    print(f"  Saved LCB generation pickle → {paths['generation_pickle']}")
+    return {
+        "release": livecodebench_release,
+        "n_samples": lcb_n_samples,
+        "temperature": lcb_temperature,
+        "output_path": str(paths["output_json"]),
+        "generation_pickle": str(paths["generation_pickle"]),
+    }
 
 
 def evaluate_lcb_from_pickle(
@@ -311,6 +330,7 @@ def evaluate_lcb_from_pickle(
     lcb_num_process_evaluate: int = 4,
     lcb_timeout: int = 6,
 ) -> dict:
+    # ── Grading (pass@k via LCB's codegen_metrics) ──
     with open(generation_pickle, "rb") as f:
         payload = pickle.load(f)
 
@@ -329,14 +349,16 @@ def evaluate_lcb_from_pickle(
         raise RuntimeError("Pickle question_ids mismatch. Regenerate pickle for this release.")
 
     paths = _build_paths(model_label, run_name, n_samples, temperature)
-    print(f"Running pass@k grading ({lcb_num_process_evaluate} workers) from {generation_pickle} ...")
+    steer_mode = "none"
+    print(f"[{steer_mode}] Running pass@k grading ({lcb_num_process_evaluate} workers) ...")
     eval_samples = [p.get_evaluation_sample() for p in benchmark_sorted]
-    metrics, results_dict, metadatas = codegen_metrics(
+    metrics_tuple = codegen_metrics(
         eval_samples,
         all_extracted,
         num_process_evaluate=lcb_num_process_evaluate,
         timeout=lcb_timeout,
     )
+    metrics, results_dict, metadatas = metrics_tuple
     graded = extract_instance_results(results_dict)
     save_eval_results = [
         p.insert_output_evaluation(o, c, g, metadata=m)
@@ -349,9 +371,17 @@ def evaluate_lcb_from_pickle(
 
     pass1 = metrics.get("pass@1", float("nan")) if isinstance(metrics, dict) else float("nan")
     pass5 = metrics.get("pass@5", float("nan")) if isinstance(metrics, dict) else float("nan")
-    print(f"LCB pass@1 = {pass1:.4f} | pass@5 = {pass5:.4f}")
-    print(f"Saved LCB eval -> {paths['eval_all_json']}")
-    return {"pass@1": pass1, "pass@5": pass5, "eval_all_path": str(paths["eval_all_json"])}
+    print(f"  Saved LCB eval → {paths['eval_all_json']}")
+    print(f"\n  [{steer_mode}] LCB pass@1 = {pass1:.4f}  |  pass@5 = {pass5:.4f}")
+    print(f"  model_repr : {model_label}-{steer_mode}")
+    print(f"  eval_all   : {paths['eval_all_json']}")
+    return {
+        "pass@1": pass1,
+        "pass@5": pass5,
+        "output_path": str(paths["output_json"]),
+        "eval_all_path": str(paths["eval_all_json"]),
+        "eval_path": str(paths["eval_json"]),
+    }
 
 
 def run_codecontests_evaluation_for_llama_instruct(
@@ -377,162 +407,34 @@ def run_codecontests_evaluation_for_llama_instruct(
     extracted_preview_chars: int = 420,
     unload_model_before_grading: bool = True,
 ) -> dict:
-    """Run LCB generation and pass@k grading.
+    if model is not None or tokenizer is not None:
+        raise ValueError("This split pipeline ignores external model/tokenizer; use generate/evaluate stages.")
 
-    When ``model`` and ``tokenizer`` are omitted, weights are loaded here and dropped
-    before grading so ``ProcessPoolExecutor`` workers are not forked from a process
-    that still maps a full Llama checkpoint (avoids multiplicative RAM on Linux).
-
-    Set ``unload_model_before_grading=False`` only if you pass a shared ``model`` you
-    still need after this call (not recommended on memory-constrained hosts).
-    """
-    owns_weights = model is None or tokenizer is None
-    if owns_weights:
-        if model is not None or tokenizer is not None:
-            raise ValueError("Pass both model and tokenizer, or neither.")
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        tokenizer = AutoTokenizer.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        model = AutoModelForCausalLM.from_pretrained(
-            LCB_LLAMA3_INSTRUCT_MODEL_ID,
-            torch_dtype=dtype,
-        ).to(device)
-    else:
-        device = next(model.parameters()).device
-
-    model.eval()
-    set_seed(seed)
-
-    lcb_repo = Path(__file__).parent / "LiveCodeBench"
-    if run_id is None:
-        run_id = "norun"
-    base_root = Path(results_root) if results_root else Path(__file__).parent / "results"
-
-    all_results: dict = {}
-    steer_mode = "none"
-
-    print(f"\n{'='*60}")
-    print(f" LiveCodeBench  (release={livecodebench_release}, n={lcb_n_samples}, T={lcb_temperature})")
-    print(f"{'='*60}")
-
-    load_code_generation_dataset, codegen_metrics, extract_instance_results = _import_lcb()
-    benchmark = load_code_generation_dataset(livecodebench_release)
-    print(f"  Loaded {len(benchmark)} LCB problems")
-
-    mode_repr = f"{model_label}-{steer_mode}"
-    lcb_out_dir = lcb_repo / "output" / mode_repr / str(run_id)
-    lcb_out_dir.mkdir(parents=True, exist_ok=True)
-    lcb_out_path = lcb_out_dir / f"codegeneration_{lcb_n_samples}_{lcb_temperature}.json"
-    lcb_eval_path = lcb_out_dir / f"codegeneration_{lcb_n_samples}_{lcb_temperature}_eval.json"
-    lcb_eval_all_path = lcb_out_dir / f"codegeneration_{lcb_n_samples}_{lcb_temperature}_eval_all.json"
-
-    print(f"\n[{steer_mode}] Generating {lcb_n_samples} solutions x {len(benchmark)} LCB problems ...")
-    all_outputs: List[List[str]] = []
-    all_extracted: List[List[str]] = []
-    benchmark_sorted = sorted(benchmark, key=lambda x: x.question_id)
-    pending_prompts: List[str] = []
-    pending_headings: List[str] = []
-
-    def _flush_batch():
-        if not pending_prompts:
-            return
-        generated = _generate_solutions_llama_batched(
-            model,
-            tokenizer,
-            pending_prompts,
-            device,
-            n_samples=lcb_n_samples,
-            max_new_tokens=lcb_max_new_tokens,
-            temperature=lcb_temperature,
-            top_p=lcb_top_p,
-            top_k=lcb_top_k,
-            repetition_penalty=lcb_repetition_penalty,
-        )
-        for heading, raw_samples in zip(pending_headings, generated):
-            extracted = [_extract_code_from_output(s) for s in raw_samples]
-            if print_extracted_code_preview:
-                print_extracted_code_samples_preview(
-                    heading,
-                    extracted,
-                    preview_chars=extracted_preview_chars,
-                )
-            all_outputs.append(raw_samples)
-            all_extracted.append(extracted)
-        pending_prompts.clear()
-        pending_headings.clear()
-
-    for problem in tqdm(benchmark_sorted, desc=f"lcb/{steer_mode}", disable=not display):
-        prompt = _format_code_generation_prompt(
-            tokenizer,
-            problem.question_content,
-            starter_code=getattr(problem, "starter_code", "") or "",
-            language="python",
-        )
-        pending_prompts.append(prompt)
-        desc_flat = problem.question_content.replace("\n", " ").strip()
-        desc_short = desc_flat[:260] + ("..." if len(desc_flat) > 260 else "")
-        pending_headings.append(
-            f"[{steer_mode}] LCB  question_id={problem.question_id}  "
-            f"description (start): {desc_short!r}"
-        )
-        if len(pending_prompts) >= max(1, int(lcb_prompt_batch_size)):
-            _flush_batch()
-    _flush_batch()
-
-    save_results = [
-        problem.insert_output(outputs, codes)
-        for problem, outputs, codes in zip(benchmark_sorted, all_outputs, all_extracted)
-    ]
-    with open(lcb_out_path, "w", encoding="utf-8") as f:
-        json.dump(save_results, f, indent=4)
-    print(f"  Saved LCB outputs -> {lcb_out_path}")
-
-    if unload_model_before_grading and owns_weights:
-        del model
-        del tokenizer
-        model = None  # type: ignore[assignment]
-        tokenizer = None  # type: ignore[assignment]
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
-
-    print(f"[{steer_mode}] Running pass@k grading ({lcb_num_process_evaluate} workers) ...")
-    eval_samples = [p.get_evaluation_sample() for p in benchmark_sorted]
-    metrics_tuple = codegen_metrics(
-        eval_samples,
-        all_extracted,
-        num_process_evaluate=lcb_num_process_evaluate,
-        timeout=lcb_timeout,
+    run_name = str(run_id) if run_id is not None else "norun"
+    gen = generate_lcb_pickle(
+        seed=seed,
+        model_label=model_label,
+        run_name=run_name,
+        display=display,
+        livecodebench_release=livecodebench_release,
+        lcb_n_samples=lcb_n_samples,
+        lcb_temperature=lcb_temperature,
+        lcb_top_p=lcb_top_p,
+        lcb_top_k=lcb_top_k,
+        lcb_max_new_tokens=lcb_max_new_tokens,
+        lcb_repetition_penalty=lcb_repetition_penalty,
+        lcb_prompt_batch_size=lcb_prompt_batch_size,
+        print_extracted_code_preview=print_extracted_code_preview,
+        extracted_preview_chars=extracted_preview_chars,
     )
-    metrics, results_dict, metadatas = metrics_tuple
-    graded = extract_instance_results(results_dict)
-    save_eval_results = [
-        p.insert_output_evaluation(o, c, g, metadata=m)
-        for p, o, c, g, m in zip(
-            benchmark_sorted, all_outputs, all_extracted, graded, metadatas
-        )
-    ]
-    with open(lcb_eval_all_path, "w", encoding="utf-8") as f:
-        json.dump(save_eval_results, f, indent=4)
-    with open(lcb_eval_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=4)
-    print(f"  Saved LCB eval -> {lcb_eval_all_path}")
-
-    pass1 = metrics.get("pass@1", float("nan")) if isinstance(metrics, dict) else float("nan")
-    pass5 = metrics.get("pass@5", float("nan")) if isinstance(metrics, dict) else float("nan")
-    print(f"\n  [none] LCB pass@1 = {pass1:.4f}  |  pass@5 = {pass5:.4f}")
-    print(f"  model_repr : {mode_repr}")
-    print(f"  eval_all   : {lcb_eval_all_path}")
-    all_results["lcb/none"] = {
-        "pass@1": pass1,
-        "pass@5": pass5,
-        "output_path": str(lcb_out_path),
-        "eval_all_path": str(lcb_eval_all_path),
-    }
-    return all_results
+    ev = evaluate_lcb_from_pickle(
+        generation_pickle=gen["generation_pickle"],
+        model_label=model_label,
+        run_name=run_name,
+        lcb_num_process_evaluate=lcb_num_process_evaluate,
+        lcb_timeout=lcb_timeout,
+    )
+    return {"lcb/none": {**ev, "generation_pickle": gen["generation_pickle"]}}
 
 
 def run_llama8b_instruct_baseline(
@@ -578,12 +480,6 @@ def run_llama8b_instruct_baseline(
 
 
 if __name__ == "__main__":
-    # Avoid fork-after-CUDA: worker processes would CoW-copy a parent that mapped Llama weights.
-    try:
-        mp.set_start_method("spawn")
-    except RuntimeError:
-        pass
-
     parser = argparse.ArgumentParser(
         description="LCB baseline split: generate pickle first, evaluate later."
     )
@@ -627,6 +523,21 @@ if __name__ == "__main__":
     p_all.add_argument("--extracted_preview_chars", type=int, default=420)
 
     args = parser.parse_args()
+    # Multiprocessing mode:
+    # - evaluate: use Linux default-style fork behavior (matches original LCB flow, avoids
+    #   spawn-related interpreter-shutdown cleanup noise seen in some container setups).
+    # - generate/all: keep spawn to avoid fork-after-CUDA pitfalls when model weights are loaded.
+    if args.command == "evaluate":
+        try:
+            mp.set_start_method("fork")
+        except RuntimeError:
+            pass
+    else:
+        try:
+            mp.set_start_method("spawn")
+        except RuntimeError:
+            pass
+
     if args.command == "generate":
         results = generate_lcb_pickle(
             seed=args.seed,

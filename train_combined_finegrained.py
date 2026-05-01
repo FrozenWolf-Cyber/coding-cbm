@@ -446,18 +446,6 @@ if __name__ == "__main__":
     valid_dataset_raw = raw_dataset["valid"]
     test_dataset_raw  = raw_dataset["test"]
 
-    if args.max_train_samples > 0:
-        train_dataset_raw = train_dataset_raw.select(range(min(args.max_train_samples, len(train_dataset_raw))))
-    if args.max_valid_samples > 0:
-        valid_dataset_raw = valid_dataset_raw.select(range(min(args.max_valid_samples, len(valid_dataset_raw))))
-    if args.max_test_samples > 0:
-        test_dataset_raw = test_dataset_raw.select(range(min(args.max_test_samples, len(test_dataset_raw))))
-
-    # DEBUG: small subset
-    if debug_mode:
-        train_dataset_raw = train_dataset_raw.select(range(min(64, len(train_dataset_raw))))
-        test_dataset_raw  = test_dataset_raw.select(range(min(32, len(test_dataset_raw))))
-
     def _has_valid_cf_tag(example):
         tags = example["cf_tags"]
         return any(tag in CODEFORCES_CONCEPT_SET_LOOKUP for tag in tags)
@@ -469,6 +457,24 @@ if __name__ == "__main__":
         languages = solutions["language"]
         texts = solutions["solution"] or []
         return any(lang in (1, 3) and isinstance(sol, str) and sol.strip() for lang, sol in zip(languages, texts))
+
+    # For debug only: keep an unsampled copy to compute full-train pre-truncation stats.
+    train_dataset_for_length_stats = None
+    if debug_mode:
+        train_dataset_for_length_stats = raw_dataset["train"].filter(_has_valid_cf_tag)
+        train_dataset_for_length_stats = train_dataset_for_length_stats.filter(_has_python_solution)
+
+    if args.max_train_samples > 0:
+        train_dataset_raw = train_dataset_raw.select(range(min(args.max_train_samples, len(train_dataset_raw))))
+    if args.max_valid_samples > 0:
+        valid_dataset_raw = valid_dataset_raw.select(range(min(args.max_valid_samples, len(valid_dataset_raw))))
+    if args.max_test_samples > 0:
+        test_dataset_raw = test_dataset_raw.select(range(min(args.max_test_samples, len(test_dataset_raw))))
+
+    # DEBUG: small subset
+    if debug_mode:
+        train_dataset_raw = train_dataset_raw.select(range(min(64, len(train_dataset_raw))))
+        test_dataset_raw  = test_dataset_raw.select(range(min(32, len(test_dataset_raw))))
 
     # Keep only rows with at least one allowed CF tag.
     filter_start = time.time()
@@ -559,8 +565,6 @@ if __name__ == "__main__":
         pick = int(rng.integers(low=0, high=len(py_candidates)))
         return py_candidates[pick]
 
-    train_token_lengths = []
-
     def _tok_train(batch, indices):
         descriptions = batch["description"]
         solutions_all = batch["solutions"]
@@ -605,7 +609,6 @@ if __name__ == "__main__":
             truncation=True,
             max_length=args.max_length,
         )
-        train_token_lengths.extend(len(ids) for ids in enc["input_ids"])
         loss_masks = []
         for attn_mask, assistant_start in zip(enc["attention_mask"], assistant_starts):
             # Shifted LM labels predict token i+1 from token i; supervise only assistant tokens.
@@ -690,19 +693,55 @@ if __name__ == "__main__":
             max_length=args.max_length,
         )
 
+    def _full_train_untruncated_len_batch(batch, indices):
+        descriptions = batch["description"]
+        solutions_all = batch["solutions"]
+        lengths = []
+        for desc, sols, row_idx in zip(descriptions, solutions_all, indices):
+            desc = (desc or "").strip()
+            user_body = build_lcb_user_prompt(
+                problem_description=desc,
+                starter_code="",
+                language="python",
+            )
+            solution = _select_random_python_solution(sols, row_idx=row_idx)
+            assistant_body = f"```python\n{solution}\n```" if solution else ""
+            messages = [
+                {"role": "system", "content": "You are an expert Python programmer. You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests."},
+                {"role": "user", "content": user_body},
+                {"role": "assistant", "content": assistant_body},
+            ]
+            full_text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+                continue_final_message=False,
+            )
+            token_ids = tokenizer(full_text, truncation=False)["input_ids"]
+            lengths.append(len(token_ids))
+        return {"full_train_untruncated_len": lengths}
+
     tokenization_start = time.time()
+    if debug_mode and (train_dataset_for_length_stats is not None):
+        print("computing full-train pre-truncation token length stats (debug mode only)...")
+        full_train_len_stats_dataset = train_dataset_for_length_stats.map(
+            _full_train_untruncated_len_batch,
+            batched=True,
+            with_indices=True,
+            batch_size=256,
+        )
+        if len(full_train_len_stats_dataset) > 0:
+            full_train_len_arr = np.asarray(full_train_len_stats_dataset["full_train_untruncated_len"], dtype=np.int32)
+            print(
+                "full train pre-truncation token length stats | "
+                f"min: {int(full_train_len_arr.min())}, "
+                f"mean: {float(full_train_len_arr.mean()):.2f}, "
+                f"median: {float(np.median(full_train_len_arr)):.2f}, "
+                f"max: {int(full_train_len_arr.max())}"
+            )
     encoded_train_dataset = train_dataset.map(_tok_train, batched=True, with_indices=True, batch_size=1024)
     encoded_valid_dataset = valid_dataset.map(_tok_valid, batched=True, with_indices=True, batch_size=1024)
     encoded_test_dataset = test_dataset.map(_tok_eval, batched=True, batch_size=1024)
-    if len(train_token_lengths) > 0:
-        train_len_arr = np.asarray(train_token_lengths, dtype=np.int32)
-        print(
-            "train token length stats | "
-            f"min: {int(train_len_arr.min())}, "
-            f"mean: {float(train_len_arr.mean()):.2f}, "
-            f"median: {float(np.median(train_len_arr)):.2f}, "
-            f"max: {int(train_len_arr.max())}"
-        )
     tokenization_elapsed = time.time() - tokenization_start
 
     # Keep only tensors (no label column in code_contests encoded datasets)

@@ -70,6 +70,20 @@ def set_seed(seed):
     np.random.seed(seed)
 
 
+def safe_wandb_log(payload):
+    """Log to W&B only when a run is initialized."""
+    if payload is None:
+        return
+    run = getattr(wandb, "run", None)
+    if run is None:
+        return
+    try:
+        wandb.log(payload)
+    except wandb.Error:
+        # Keep evaluation running in debug/non-wandb mode.
+        pass
+
+
 _CACHED_LLAMA_VOCAB_WEIGHT = None
 CLEANED_TAGS_MAP = pickle.load(open(Path(__file__).parent / "cleaned_tags.pkl", "rb"))
 
@@ -571,7 +585,7 @@ def run_codecontests_evaluation_for_cbm(
             }
             log_payload.update(concept_acc_metrics)
             if wandb.run is not None:
-                wandb.log(log_payload)
+                safe_wandb_log(log_payload)
             all_results[f"cc/{steer_mode}"] = {"output_path": str(out_path), **concept_acc_metrics}
 
     # ═════════════════════════════════════════════════════════════════════════
@@ -711,7 +725,7 @@ def run_codecontests_evaluation_for_cbm(
             f"lcb/{steer_mode}/output_path": str(lcb_out_path),
         }
         if wandb.run is not None:
-            wandb.log(log_payload)
+            safe_wandb_log(log_payload)
         all_results[f"lcb/{steer_mode}"] = {
             "pass@1": pass1, "pass@5": pass5,
             "output_path": str(lcb_out_path),
@@ -991,7 +1005,7 @@ def generate_steerability_texts(
         concept_texts = [all_slots[concept_idx][k] for k in range(samples_per_concept)]
         if should_log_samples_to_wandb:
             for idx, t in enumerate(concept_texts):
-                wandb.log({f"steerability_sample_{cname}_{idx + 1}": t})
+                safe_wandb_log({f"steerability_sample_{cname}_{idx + 1}": t})
         if print_k > 0:
             print(f"Concept '{cname}' sample preview:")
             for k in range(min(print_k, len(concept_texts))):
@@ -1069,7 +1083,7 @@ def run_steerability_roberta(
         )
         log_key = "steerability_test_accuracy" if clf_idx == 0 else f"steerability_test_accuracy_{clf_idx}"
         print(f"  {log_key}: {acc}")
-        wandb.log({log_key: acc})
+        safe_wandb_log({log_key: acc})
         results[log_key] = acc
 
         del classifier
@@ -1163,7 +1177,7 @@ def run_steerability_mpnet(
         "steerability_top10_acc": top10_correct / total_evals if total_evals else 0.0,
         "steerability_top20_acc": top20_correct / total_evals if total_evals else 0.0,
     }
-    wandb.log(metrics)
+    safe_wandb_log(metrics)
     for k, v in metrics.items():
         print(f"  {k}: {v}")
     return metrics
@@ -1301,7 +1315,7 @@ def run_steerability_llamacpp_judge(
                     "raw_output": raw,
                 }
             )
-            wandb.log(
+            safe_wandb_log(
                 {
                     f"steerability_llamacpp_pred_{target_idx}_{sample_idx}": pred_label,
                     f"steerability_llamacpp_correct_{target_idx}_{sample_idx}": is_correct,
@@ -1314,7 +1328,7 @@ def run_steerability_llamacpp_judge(
         "steerability_llamacpp_judge_total": int(total),
     }
     print(f"  steerability_llamacpp_judge_accuracy: {acc:.4f} ({correct}/{total})")
-    wandb.log(metrics)
+    safe_wandb_log(metrics)
 
     return {"metrics": metrics, "raw_outputs": raw_outputs}
 
@@ -1341,7 +1355,7 @@ def run_concept_accuracy_labels(preLM, cbl, test_loader, concept_set, encoded_te
     metric.add_batch(predictions=pred, references=encoded_test_dataset["label"])
     acc = metric.compute()
     print(f"Concept prediction accuracy: {acc}")
-    wandb.log({"concept_prediction_accuracy": acc})
+    safe_wandb_log({"concept_prediction_accuracy": acc})
     return acc
 
 
@@ -1450,7 +1464,7 @@ def run_concept_accuracy_cosine(
         **topk_acc,
         **topk_iou,
     }
-    wandb.log(metrics)
+    safe_wandb_log(metrics)
     return metrics
 
 
@@ -1475,7 +1489,7 @@ def run_weight_analysis(cbl, concept_set, tokenizer):
 
     sparsity = (w > 1e-6).count_nonzero() / w.numel()
     print(f"Sparsity of concept weight matrix: {sparsity}")
-    wandb.log({"concept_weight_sparsity": sparsity})
+    safe_wandb_log({"concept_weight_sparsity": sparsity})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1552,11 +1566,11 @@ def compute_perplexity(texts: list[str]) -> dict:
             model_id=LCB_LLAMA3_INSTRUCT_MODEL_ID, max_length=100,
         )["mean_perplexity"]
         print(f"Perplexity (under 30 tokens): {ppl_short}")
-        wandb.log({"perplexity_under_30_tokens": ppl_short})
+        safe_wandb_log({"perplexity_under_30_tokens": ppl_short})
         results["perplexity_under_30_tokens"] = ppl_short
     else:
         print("No generated texts under 30 tokens to compute perplexity.")
-        wandb.log({"perplexity_under_30_tokens": None})
+        safe_wandb_log({"perplexity_under_30_tokens": None})
 
     perplexity_all = evaluate.load("perplexity", module_type="metric")
     for p in texts:
@@ -1565,7 +1579,7 @@ def compute_perplexity(texts: list[str]) -> dict:
         model_id=LCB_LLAMA3_INSTRUCT_MODEL_ID, max_length=100,
     )["mean_perplexity"]
     print(f"Perplexity (all tokens): {ppl_all}")
-    wandb.log({"perplexity_all_tokens": ppl_all})
+    safe_wandb_log({"perplexity_all_tokens": ppl_all})
     results["perplexity_all_tokens"] = ppl_all
 
     return results
@@ -1692,7 +1706,7 @@ def run_rm_metrics(
         }
 
         for b, (t, r, g, o) in enumerate(zip(texts, rel, gram, tog)):
-            wandb.log({
+            safe_wandb_log({
                 f"rm_sample_{concept_name}_{b + 1}": t,
                 f"rm_relevance_logit_{concept_name}_{b + 1}": r,
                 f"rm_grammar_logit_{concept_name}_{b + 1}": g,
@@ -1715,7 +1729,7 @@ def run_rm_metrics(
         "rm_together_mean": t_m, "rm_together_std": t_s,
         "rm_total_n": len(all_rel),
     }
-    wandb.log(global_metrics)
+    safe_wandb_log(global_metrics)
     print(
         f"  rm_relevance_mean={r_m:.4f} rm_grammar_mean={g_m:.4f} "
         f"rm_together_mean={t_m:.4f} (n={len(all_rel)})"
