@@ -85,7 +85,7 @@ parser.add_argument(
 
 parser.add_argument("--batch_size", type=int, default=4)
 parser.add_argument("--epoch_multiplier", type=int, default=1, help="Epoch multiplier to increase total training steps (for debugging).")
-parser.add_argument("--max_length", type=int, default=2048)
+parser.add_argument("--max_length", type=int, default=1024)
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument(
