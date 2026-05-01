@@ -1,5 +1,6 @@
 import ast
 import json
+import os
 import sys
 import faulthandler
 import platform
@@ -24,7 +25,20 @@ from enum import Enum
 from decimal import Decimal
 import time
 
-import_string = "from string import *\nfrom re import *\nfrom datetime import *\nfrom collections import *\nfrom heapq import *\nfrom bisect import *\nfrom copy import *\nfrom math import *\nfrom random import *\nfrom statistics import *\nfrom itertools import *\nfrom functools import *\nfrom operator import *\nfrom io import *\nfrom sys import *\nfrom json import *\nfrom builtins import *\nfrom typing import *\nimport string\nimport re\nimport datetime\nimport collections\nimport heapq\nimport bisect\nimport copy\nimport math\nimport random\nimport statistics\nimport itertools\nimport functools\nimport operator\nimport io\nimport sys\nimport json\nsys.setrecursionlimit(50000)\n"
+# Cap recursion for sandboxed solutions: 50k can overflow the C stack and segfault before
+# Python raises RecursionError. Override with LCB_RECURSION_LIMIT (clamped to [800, 20000]).
+_LCB_RECURSION_LIMIT = int(os.environ.get("LCB_RECURSION_LIMIT", "12000"))
+_LCB_RECURSION_LIMIT = max(800, min(20000, _LCB_RECURSION_LIMIT))
+import_string = (
+    "from string import *\nfrom re import *\nfrom datetime import *\nfrom collections import *\n"
+    "from heapq import *\nfrom bisect import *\nfrom copy import *\nfrom math import *\nfrom random import *\n"
+    "from statistics import *\nfrom itertools import *\nfrom functools import *\nfrom operator import *\n"
+    "from io import *\nfrom sys import *\nfrom json import *\nfrom builtins import *\nfrom typing import *\n"
+    "import string\nimport re\nimport datetime\nimport collections\nimport heapq\nimport bisect\n"
+    "import copy\nimport math\nimport random\nimport statistics\nimport itertools\nimport functools\n"
+    "import operator\nimport io\nimport sys\nimport json\n"
+    f"sys.setrecursionlimit({_LCB_RECURSION_LIMIT})\n"
+)
 
 
 def truncatefn(s, length=300):

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import multiprocessing as mp
 from pathlib import Path
 from typing import List, Optional
 
@@ -118,8 +120,8 @@ def _generate_solutions_llama_batched(
 
 
 def run_codecontests_evaluation_for_llama_instruct(
-    model,
-    tokenizer,
+    model=None,
+    tokenizer=None,
     seed: int = 42,
     model_label: str = "Llama3-8B-Instruct-baseline",
     layer_idx: int = -1,
@@ -134,18 +136,43 @@ def run_codecontests_evaluation_for_llama_instruct(
     lcb_max_new_tokens: int = 2000,
     lcb_repetition_penalty: float = 1.05,
     lcb_prompt_batch_size: int = 4,
-    lcb_num_process_evaluate: int = 8,
+    lcb_num_process_evaluate: int = 4,
     lcb_timeout: int = 6,
     print_extracted_code_preview: bool = False,
     extracted_preview_chars: int = 420,
+    unload_model_before_grading: bool = True,
 ) -> dict:
+    """Run LCB generation and pass@k grading.
+
+    When ``model`` and ``tokenizer`` are omitted, weights are loaded here and dropped
+    before grading so ``ProcessPoolExecutor`` workers are not forked from a process
+    that still maps a full Llama checkpoint (avoids multiplicative RAM on Linux).
+
+    Set ``unload_model_before_grading=False`` only if you pass a shared ``model`` you
+    still need after this call (not recommended on memory-constrained hosts).
+    """
+    owns_weights = model is None or tokenizer is None
+    if owns_weights:
+        if model is not None or tokenizer is not None:
+            raise ValueError("Pass both model and tokenizer, or neither.")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        tokenizer = AutoTokenizer.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        model = AutoModelForCausalLM.from_pretrained(
+            LCB_LLAMA3_INSTRUCT_MODEL_ID,
+            torch_dtype=dtype,
+        ).to(device)
+    else:
+        device = next(model.parameters()).device
+
     model.eval()
     set_seed(seed)
 
     lcb_repo = Path(__file__).parent / "LiveCodeBench"
     if run_id is None:
         run_id = wandb.run.id if wandb.run is not None else "norun"
-    device = next(model.parameters()).device
     base_root = Path(results_root) if results_root else Path(__file__).parent / "results"
 
     all_results: dict = {}
@@ -227,6 +254,16 @@ def run_codecontests_evaluation_for_llama_instruct(
         json.dump(save_results, f, indent=4)
     print(f"  Saved LCB outputs -> {lcb_out_path}")
 
+    if unload_model_before_grading and owns_weights:
+        del model
+        del tokenizer
+        model = None  # type: ignore[assignment]
+        tokenizer = None  # type: ignore[assignment]
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+
     print(f"[{steer_mode}] Running pass@k grading ({lcb_num_process_evaluate} workers) ...")
     eval_samples = [p.get_evaluation_sample() for p in benchmark_sorted]
     metrics_tuple = codegen_metrics(
@@ -288,28 +325,15 @@ def run_llama8b_instruct_baseline(
     lcb_top_k: int = 50,
     lcb_max_new_tokens: int = 2000,
     lcb_prompt_batch_size: int = 4,
-    lcb_num_process_evaluate: int = 8,
+    lcb_num_process_evaluate: int = 4,
     lcb_timeout: int = 6,
     print_extracted_code_preview: bool = False,
     extracted_preview_chars: int = 420,
+    unload_model_before_grading: bool = True,
 ) -> dict:
-    set_seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    tokenizer = AutoTokenizer.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(
-        LCB_LLAMA3_INSTRUCT_MODEL_ID,
-        torch_dtype=dtype,
-    ).to(device)
-    model.eval()
-
     return run_codecontests_evaluation_for_llama_instruct(
-        model=model,
-        tokenizer=tokenizer,
+        model=None,
+        tokenizer=None,
         seed=seed,
         model_label=model_label,
         run_id=run_id,
@@ -326,10 +350,17 @@ def run_llama8b_instruct_baseline(
         lcb_timeout=lcb_timeout,
         print_extracted_code_preview=print_extracted_code_preview,
         extracted_preview_chars=extracted_preview_chars,
+        unload_model_before_grading=unload_model_before_grading,
     )
 
 
 if __name__ == "__main__":
+    # Avoid fork-after-CUDA: worker processes would CoW-copy a parent that mapped Llama weights.
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
+
     parser = argparse.ArgumentParser(
         description="Run pure Llama-3-8B-Instruct baseline on code_contests + LiveCodeBench."
     )
@@ -343,8 +374,19 @@ if __name__ == "__main__":
     parser.add_argument("--lcb_top_k", type=int, default=50)
     parser.add_argument("--lcb_max_new_tokens", type=int, default=2000)
     parser.add_argument("--lcb_prompt_batch_size", type=int, default=4)
-    parser.add_argument("--lcb_num_process_evaluate", type=int, default=8)
+    parser.add_argument(
+        "--lcb_num_process_evaluate",
+        type=int,
+        default=4,
+        help="Parallel LCB grading workers (each task also spawns short-lived helper processes). "
+        "Lower if the host OOMs during eval (try 2 on ~64Gi RAM with the model still in memory elsewhere).",
+    )
     parser.add_argument("--lcb_timeout", type=int, default=6)
+    parser.add_argument(
+        "--keep_model_loaded_for_grading",
+        action="store_true",
+        help="Skip unloading the LLM before pass@k grading (uses more RAM; only for debugging).",
+    )
     parser.add_argument(
         "--print_extracted_code_preview",
         action="store_true",
@@ -396,6 +438,7 @@ if __name__ == "__main__":
             lcb_timeout=args.lcb_timeout,
             print_extracted_code_preview=args.print_extracted_code_preview,
             extracted_preview_chars=args.extracted_preview_chars,
+            unload_model_before_grading=not args.keep_model_loaded_for_grading,
         )
         print(json.dumps(results, indent=2))
     finally:
