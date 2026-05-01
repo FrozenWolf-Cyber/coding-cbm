@@ -362,7 +362,7 @@ def run_codecontests_evaluation_for_cbm(
     lcb_top_k: int = 50,
     lcb_max_new_tokens: int = 2000,
     lcb_repetition_penalty: float = 1.05,
-    lcb_num_process_evaluate: int = 8,
+    lcb_num_process_evaluate: int = 4,
     lcb_timeout: int = 6,
     livecodebench_split: str = "test",
     print_extracted_code_preview: bool = False,

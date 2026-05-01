@@ -1,4 +1,5 @@
 import argparse
+import multiprocessing as mp
 import os
 import time
 
@@ -48,8 +49,9 @@ parser = argparse.ArgumentParser()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# code_contests dataset (loaded from HuggingFace deepmind/code_contests)
-parser.add_argument("--dataset", type=str, default="code_contests", choices=["code_contests"])
+# This script only runs the HuggingFace deepmind/code_contests pipeline (no dataset switch).
+DATASET = "code_contests"
+
 parser.add_argument(
     "--max_train_samples",
     type=int,
@@ -101,11 +103,14 @@ parser.add_argument("--elastic_net_alpha", type=float, default=1.0)
 parser.add_argument("--residual_dim", type=int, default=768)
 parser.add_argument("--orthogonal_loss_weight", type=float, default=0)
 parser.add_argument("--residual_penalty_weight", type=float, default=0)
-parser.add_argument("--DEBUG", action='store_true', help="If set, use a smaller subset of data for quick debugging.")
 parser.add_argument(
     "--debug",
+    "--DEBUG",
     action="store_true",
-    help="Debug mode: run only 2 epochs and 2 train steps/epoch, disable wandb logging, keep eval.",
+    help=(
+        "Debug mode: small train/test subset, 2 epochs and few train steps per epoch, "
+        "disable wandb; evaluation still runs."
+    ),
 )
 parser.add_argument("--intervention_gen_loss", type=float, default=0.0)
 parser.add_argument("--no_detach_intervention", action='store_true', help="If set, do not detach unsup during intervention generation loss computation.")
@@ -121,7 +126,7 @@ parser.add_argument(
 )
 
 
-parser.add_argument("--concept_loss_type", type=str, default="cosine_cubed", help="Type of concept loss to use: 'cosine_cubed' or 'ce'.")
+parser.add_argument("--concept_loss_type", type=str, default="ce", help="Type of concept loss to use: 'cosine_cubed' or 'ce'.")
 
 # Label sources
 parser.add_argument("--labeling", type=str, default="direct", choices=["direct"], help="Concept label source. 'direct' uses CF tags from the dataset.")
@@ -243,7 +248,7 @@ parser.add_argument(
     default="none,groundtruth",
     help="Comma-separated list of steering modes to evaluate: none,groundtruth.",
 )
-# Intervention value for LCB steering is taken from get_intervention_value(args.dataset).
+# Intervention value for LCB steering is taken from get_intervention_value(DATASET).
 # LCB generation params — defaults match the leaderboard so numbers are comparable.
 parser.add_argument(
     "--lcb_n_samples",
@@ -272,8 +277,11 @@ parser.add_argument(
 parser.add_argument(
     "--lcb_num_process_evaluate",
     type=int,
-    default=8,
-    help="Parallel workers for LCB pass@k grading.",
+    default=2,
+    help=(
+        "Parallel workers for LCB pass@k grading. "
+        "Lower this on RAM-constrained hosts (for example, 2 on ~64Gi RAM)."
+    ),
 )
 parser.add_argument(
     "--lcb_timeout",
@@ -282,9 +290,18 @@ parser.add_argument(
     help="Per-test-case timeout (seconds) for LCB grading.",
 )
 parser.add_argument(
+    "--lcb_recursion_limit",
+    type=int,
+    default=12000,
+    help=(
+        "Recursion limit injected into sandboxed LiveCodeBench code execution. "
+        "Kept below extreme values to reduce C-stack segfault risk."
+    ),
+)
+parser.add_argument(
     "--lcb_prompt_batch_size",
     type=int,
-    default=4,
+    default=1,
     help=(
         "How many LCB prompts to generate in each GPU batched forward pass "
         "(also used for batched code_contests generation; passed as batch_size to run_codecontests_evaluation_for_cbm)."
@@ -345,16 +362,22 @@ def build_loaders(encoded_dataset, s, mode):
 
 
 if __name__ == "__main__":
+    # Use spawn so LCB grading workers do not fork a CUDA parent process.
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
+    os.environ.setdefault("LCB_RECURSION_LIMIT", str(args.lcb_recursion_limit))
     set_seed(args.seed)
-    debug_mode = args.debug or args.DEBUG
+    debug_mode = args.debug
 
     use_wandb = not debug_mode
     if use_wandb:
         wandb.init(
             project="coding-qa",
-            name=f"finegrained-{args.dataset}-seed{args.seed}",
+            name=f"finegrained-{DATASET}-seed{args.seed}",
             config=vars(args),
         )
         run_name = wandb.run.id
@@ -435,7 +458,7 @@ if __name__ == "__main__":
                 if tag in concept_set_idx:
                     sim[i, concept_set_idx[tag]] = 1.0
             if sim[i].sum() == 0:
-                raise ValueError(f"Row {i} has no valid CF tags in concept_set. Check dataset filtering and concept_set for {args.dataset}.")
+                raise ValueError(f"Row {i} has no valid CF tags in concept_set. Check dataset filtering and concept_set for {DATASET}.")
         return sim
 
     train_similarity = _build_multihot(train_dataset_raw)
@@ -632,7 +655,7 @@ if __name__ == "__main__":
     # concept_set already built above from CF tags; concept_set_for_similarity == concept_set
     print("concept len: ", len(concept_set))
 
-    d_name = args.dataset.replace('/', '_')
+    d_name = DATASET.replace('/', '_')
     label_prefix = "./"   # unused for code_contests (supervision built directly from CF tags)
     # val_similarity already set above (None unless you want to add valid split eval)
 
@@ -648,7 +671,7 @@ if __name__ == "__main__":
     if train_similarity.ndim != 2 or train_similarity.shape[1] != len(concept_set):
         raise ValueError(
             f"Unexpected train_similarity shape {train_similarity.shape}; expected (N, {len(concept_set)}). "
-            f"Check concept vectors / labels and concept_set for {args.dataset}."
+            f"Check concept vectors / labels and concept_set for {DATASET}."
         )
 
     # NOTE: FEVER label-based concept masking is not applied for code_contests.
@@ -703,12 +726,12 @@ if __name__ == "__main__":
         opt_classifier = torch.optim.Adam(classifier.parameters(), lr=1e-3)
 
 
-    intervention_value = get_intervention_value(args.dataset)
+    intervention_value = get_intervention_value(DATASET)
 
 
     print("start training...")
     best_loss = float('inf')
-    d_name = args.dataset.replace('/', '_')
+    d_name = DATASET.replace('/', '_')
     prefix = "./"
     prefix += "./from_pretained_llama3_lora_cbm_" + run_name
     prefix += "/"
@@ -796,7 +819,7 @@ if __name__ == "__main__":
                 
             if args.intervention_gen_loss > 0:
                 ### concepts shapes: (B, seq_len, concept_dim)
-                intervention_value = get_intervention_value(args.dataset)
+                intervention_value = get_intervention_value(DATASET)
 
                 intervened_concept = build_intervened_concepts_from_similarity(
                     concepts=concepts,
@@ -1103,7 +1126,7 @@ if __name__ == "__main__":
     cbl.eval()
 
     # ── Configure evaluation ──
-    intervention_value = get_intervention_value(args.dataset)
+    intervention_value = get_intervention_value(DATASET)
     num_steerability_samples = (
         max(1, args.samples_per_concept)
         if args.samples_per_concept is not None
@@ -1115,7 +1138,7 @@ if __name__ == "__main__":
     # ── Generate steerability texts (cached) ──
     set_seed(args.seed)
     decoded_texts_by_concept = generate_steerability_texts(
-        preLM, cbl, tokenizer, concept_set, args.dataset, device,
+        preLM, cbl, tokenizer, concept_set, DATASET, device,
         samples_per_concept=num_steerability_samples,
         llama_vocab_weight=llama_vocab_weight,
         keep_other_concepts=args.intervention_keep_other_concepts,
@@ -1160,7 +1183,7 @@ if __name__ == "__main__":
                 test_dataset=test_dataset,
                 batch_size=args.lcb_prompt_batch_size,
                 seed=args.seed,
-                model_label=f"CBM-Llama3-{args.dataset}",
+                model_label=f"CBM-Llama3-{DATASET}",
                 layer_idx=best_epoch,
                 run_id=run_name,
                 # code_contests generation params
@@ -1174,7 +1197,7 @@ if __name__ == "__main__":
                 display=not debug_mode,
                 # Steering
                 steer_modes=lcb_steer_modes,
-                steer_value=get_intervention_value(args.dataset),
+                steer_value=get_intervention_value(DATASET),
                 keep_other_concepts=args.intervention_keep_other_concepts,
                 # LiveCodeBench
                 livecodebench_release=args.livecodebench_release,
