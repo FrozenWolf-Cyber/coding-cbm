@@ -338,6 +338,14 @@ def _import_lcb():
     return load_code_generation_dataset, codegen_metrics, extract_instance_results
 
 
+def _memory_checkpoint(msg: str) -> None:
+    """Log a progress line and encourage freeing cached allocator memory."""
+    print(f"[eval-mem] {msg}", flush=True)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def run_codecontests_evaluation_for_cbm(
@@ -420,6 +428,8 @@ def run_codecontests_evaluation_for_cbm(
 
     all_results: dict = {}
 
+    _memory_checkpoint("run_codecontests_evaluation_for_cbm: start (before code_contests)")
+
     # ═════════════════════════════════════════════════════════════════════════
     # 1. code_contests internal test set  (1 sample per problem, pass@1)
     # ═════════════════════════════════════════════════════════════════════════
@@ -435,7 +445,7 @@ def run_codecontests_evaluation_for_cbm(
             cc_dir.mkdir(parents=True, exist_ok=True)
             out_path = cc_dir / f"l{layer_idx}-seed{seed}-{run_id}.jsonl"
 
-            print(f"\n[{steer_mode}] Generating solutions for code_contests test set ...")
+            print(f"\n[{steer_mode}] Generating solutions for code_contests test set ...", flush=True)
             rows = []
             concept_pred_rows = []
             concept_target_rows = []
@@ -485,6 +495,7 @@ def run_codecontests_evaluation_for_cbm(
                 pending_prompts.clear()
                 pending_intervenes.clear()
                 pending_meta_rows.clear()
+                del generated
 
             for i in tqdm(range(len(test_dataset)), desc=f"cc/{steer_mode}", disable=not display):
                 problem = test_dataset[i]
@@ -546,7 +557,11 @@ def run_codecontests_evaluation_for_cbm(
             with open(out_path, "w", encoding="utf-8") as f:
                 for row in rows:
                     f.write(json.dumps(row) + "\n")
-            print(f"  Saved {len(rows)} solutions → {out_path}")
+            print(f"  Saved {len(rows)} solutions → {out_path}", flush=True)
+            print(
+                f"[eval-mem] code_contests/{steer_mode}: jsonl written; computing concept-tag metrics ...",
+                flush=True,
+            )
 
             concept_acc_metrics = {}
             if concept_pred_rows:
@@ -578,6 +593,7 @@ def run_codecontests_evaluation_for_cbm(
                     f"cos={topk_metrics['cosine_raw']:.4f}, "
                     f"cos_cubed={topk_metrics['cosine_cubed']:.4f}"
                 )
+                del pred_tensor, target_tensor
 
             log_payload = {
                 f"cc/{steer_mode}/solutions_written": len(rows),
@@ -587,20 +603,26 @@ def run_codecontests_evaluation_for_cbm(
             if wandb.run is not None:
                 safe_wandb_log(log_payload)
             all_results[f"cc/{steer_mode}"] = {"output_path": str(out_path), **concept_acc_metrics}
+            del rows, concept_pred_rows, concept_target_rows
+
+        del concept_index
+        _memory_checkpoint("code_contests: all steer_modes done (concept_index dropped)")
 
     # ═════════════════════════════════════════════════════════════════════════
     # 2. LiveCodeBench  (n_samples per problem, full pass@k grading)
     # ═════════════════════════════════════════════════════════════════════════
 
-    print(f"\n{'='*60}")
-    print(f" LiveCodeBench  (release={livecodebench_release}, n={lcb_n_samples}, T={lcb_temperature})")
-    print(f"{'='*60}")
-    
-    
+    print(f"\n{'='*60}", flush=True)
+    print(f" LiveCodeBench  (release={livecodebench_release}, n={lcb_n_samples}, T={lcb_temperature})", flush=True)
+    print(f"{'='*60}", flush=True)
+    _memory_checkpoint("LiveCodeBench: before _import_lcb / HF dataset load")
+
     load_code_generation_dataset, codegen_metrics, extract_instance_results = _import_lcb()
+    print("[eval-mem] LiveCodeBench: _import_lcb done; calling load_code_generation_dataset ...", flush=True)
 
     benchmark = load_code_generation_dataset(livecodebench_release)
-    print(f"  Loaded {len(benchmark)} LCB problems")
+    print(f"  Loaded {len(benchmark)} LCB problems", flush=True)
+    _memory_checkpoint("LiveCodeBench: benchmark loaded")
     for steer_mode in steer_modes:
         # LCB canonical output path mirrors what main.py would produce.
         # model_repr = "{model_label}-{steer_mode}"  → leaderboard row label
@@ -652,6 +674,7 @@ def run_codecontests_evaluation_for_cbm(
             pending_lcb_prompts.clear()
             pending_lcb_intervenes.clear()
             pending_lcb_headings.clear()
+            del generated
 
         for problem in tqdm(benchmark_sorted, desc=f"lcb/{steer_mode}", disable=not display):
             text_for_steer = problem.question_content  # problem statement text
@@ -678,6 +701,12 @@ def run_codecontests_evaluation_for_cbm(
             if len(pending_lcb_prompts) >= prompt_batch_size:
                 _flush_lcb_batch()
         _flush_lcb_batch()
+        print(
+            f"[eval-mem] LCB steer_mode={steer_mode!r}: generation loop finished "
+            f"({len(all_outputs)} prompt batches)",
+            flush=True,
+        )
+        _memory_checkpoint(f"LCB/{steer_mode}: before building save_results JSON")
         # Save in LCB canonical JSON format
         save_results = [
             problem.insert_output(outputs, codes)
@@ -685,29 +714,42 @@ def run_codecontests_evaluation_for_cbm(
         ]
         with open(lcb_out_path, "w") as f:
             json.dump(save_results, f, indent=4)
-        print(f"  Saved LCB outputs → {lcb_out_path}")
+        print(f"  Saved LCB outputs → {lcb_out_path}", flush=True)
+        del save_results
+        _memory_checkpoint(f"LCB/{steer_mode}: wrote generations JSON; starting pass@k grading")
         # ── Grading (pass@k via LCB's codegen_metrics) ──
-        print(f"[{steer_mode}] Running pass@k grading ({lcb_num_process_evaluate} workers) ...")
+        print(f"[{steer_mode}] Running pass@k grading ({lcb_num_process_evaluate} workers) ...", flush=True)
         eval_samples = [p.get_evaluation_sample() for p in benchmark_sorted]
+        print(
+            f"[eval-mem] LCB/{steer_mode}: built eval_samples (n={len(eval_samples)}); calling codegen_metrics ...",
+            flush=True,
+        )
         metrics_tuple = codegen_metrics(
             eval_samples,
             all_extracted,
             num_process_evaluate=lcb_num_process_evaluate,
             timeout=lcb_timeout,
         )
+        print(f"[eval-mem] LCB/{steer_mode}: codegen_metrics returned", flush=True)
         metrics, results_dict, metadatas = metrics_tuple
+        del metrics_tuple
         graded = extract_instance_results(results_dict)
+        del results_dict
         save_eval_results = [
             p.insert_output_evaluation(o, c, g, metadata=m)
             for p, o, c, g, m in zip(
                 benchmark_sorted, all_outputs, all_extracted, graded, metadatas
             )
         ]
+        del graded, metadatas
         with open(lcb_eval_all_path, "w") as f:
             json.dump(save_eval_results, f, indent=4)
         with open(lcb_eval_path, "w") as f:
             json.dump(metrics, f, indent=4)
-        print(f"  Saved LCB eval → {lcb_eval_all_path}")
+        print(f"  Saved LCB eval → {lcb_eval_all_path}", flush=True)
+        del save_eval_results
+        del eval_samples, all_outputs, all_extracted, benchmark_sorted
+        _memory_checkpoint(f"LCB/{steer_mode}: eval JSON written; dropped large buffers")
         # ── Log & report ──
         pass1 = metrics.get("pass@1", float("nan")) if isinstance(metrics, dict) else float("nan")
         pass5 = metrics.get("pass@5", float("nan")) if isinstance(metrics, dict) else float("nan")
@@ -732,7 +774,8 @@ def run_codecontests_evaluation_for_cbm(
             "eval_all_path": str(lcb_eval_all_path),
         }
 
-
+    del benchmark
+    _memory_checkpoint("run_codecontests_evaluation_for_cbm: LCB complete; benchmark freed")
 
     return all_results
 

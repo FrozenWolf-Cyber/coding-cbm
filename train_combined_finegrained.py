@@ -1,4 +1,5 @@
 import argparse
+import gc
 import multiprocessing as mp
 import os
 import time
@@ -1208,7 +1209,6 @@ if __name__ == "__main__":
     print("time of training CBM:", (end - start) / 3600, "hours")
     
     ## delete training objects and free GPU before evaluation
-    import gc
     if llama_vocab_weight is not None:
         del llama_vocab_weight
         llama_vocab_weight = None
@@ -1296,6 +1296,23 @@ if __name__ == "__main__":
     # ── Final test: code_contests test set + LiveCodeBench (unsteered & steered) ──
     if not args.skip_code_final_test:
         try:
+            print(
+                "[pre-code-eval] Dropping training loaders / encoded splits / similarity matrices "
+                "(keeping test_dataset for code_contests eval) ...",
+                flush=True,
+            )
+            if train_dataset_for_length_stats is not None:
+                del train_dataset_for_length_stats
+                train_dataset_for_length_stats = None
+            del train_loader, valid_loader, test_loader
+            del encoded_train_dataset, encoded_valid_dataset, encoded_test_dataset
+            del train_similarity, val_similarity, test_similarity_for_eval, test_dummy_sim
+            del train_dataset, valid_dataset
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print("[pre-code-eval] gc/cuda done; calling run_codecontests_evaluation_for_cbm ...", flush=True)
+
             lcb_steer_modes = [m.strip() for m in args.lcb_steer_modes.split(",") if m.strip()]
             print(f"Running code generation evaluation  (steer_modes={lcb_steer_modes}) ...")
             run_codecontests_evaluation_for_cbm(
