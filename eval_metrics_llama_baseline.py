@@ -19,6 +19,39 @@ from shared_code_prompt import (
     format_lcb_llama3_instruct_prompt,
 )
 
+# Same k_list as LiveCodeBench codegen_metrics (pass@k table).
+_LCB_K_LIST = [1, 5, 10, 20, 40, 50, 75, 100, 125, 150, 200, 500, 1000]
+
+
+def _rss_mb() -> Optional[float]:
+    try:
+        import psutil
+
+        return psutil.Process().memory_info().rss / (1024**2)
+    except Exception:
+        try:
+            with open("/proc/self/status", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        parts = line.split()
+                        return float(parts[1]) / 1024.0  # kB -> MB
+        except Exception:
+            pass
+    return None
+
+
+def _log_memory(tag: str) -> None:
+    rss = _rss_mb()
+    if rss is not None:
+        print(f"[mem] {tag} rss_mb={rss:.1f}", flush=True)
+    gc.collect()
+
+
+def _truncate(s: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(s) <= max_chars:
+        return s
+    return s[:max_chars] + "\n... [truncated]"
+
 
 def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
@@ -77,9 +110,9 @@ def _import_lcb():
         sys.path.insert(0, lcb_path)
     from lcb_runner.benchmarks.code_generation import load_code_generation_dataset
     from lcb_runner.evaluation.compute_code_generation_metrics import codegen_metrics
-    from lcb_runner.evaluation.pass_k_utils import extract_instance_results
+    from lcb_runner.evaluation.pass_k_utils import compute_metrics_from_results, extract_instance_results
 
-    return load_code_generation_dataset, codegen_metrics, extract_instance_results
+    return load_code_generation_dataset, codegen_metrics, extract_instance_results, compute_metrics_from_results
 
 
 @torch.no_grad()
@@ -228,7 +261,7 @@ def generate_lcb_pickle(
     print(f"\n{'='*60}")
     print(f" LiveCodeBench  (release={livecodebench_release}, n={lcb_n_samples}, T={lcb_temperature})")
     print(f"{'='*60}")
-    load_code_generation_dataset, _, _ = _import_lcb()
+    load_code_generation_dataset, _, _, _ = _import_lcb()
     benchmark = load_code_generation_dataset(livecodebench_release)
     print(f"  Loaded {len(benchmark)} LCB problems")
     benchmark_sorted = sorted(benchmark, key=lambda x: x.question_id)
@@ -329,8 +362,15 @@ def evaluate_lcb_from_pickle(
     run_name: str = "norun",
     lcb_num_process_evaluate: int = 4,
     lcb_timeout: int = 6,
+    eval_debug: bool = False,
+    eval_debug_desc_chars: int = 4000,
+    eval_debug_code_chars: int = 12000,
+    eval_debug_print_raw_outputs: bool = False,
 ) -> dict:
     # ── Grading (pass@k via LCB's codegen_metrics) ──
+    # Crashes here are often NOT RAM-related: sandboxed model code can segfault,
+    # multiprocessing.Manager() leaks / fork interactions, or interpreter shutdown
+    # races — high host RAM does not prevent C-stack overflow in user solutions.
     with open(generation_pickle, "rb") as f:
         payload = pickle.load(f)
 
@@ -341,7 +381,10 @@ def evaluate_lcb_from_pickle(
     all_extracted = payload["all_extracted"]
     saved_qids = payload["question_ids"]
 
-    load_code_generation_dataset, codegen_metrics, extract_instance_results = _import_lcb()
+    load_code_generation_dataset, codegen_metrics, extract_instance_results, compute_metrics_from_results = (
+        _import_lcb()
+    )
+
     benchmark = load_code_generation_dataset(release)
     benchmark_sorted = sorted(benchmark, key=lambda x: x.question_id)
     qids = [p.question_id for p in benchmark_sorted]
@@ -350,16 +393,78 @@ def evaluate_lcb_from_pickle(
 
     paths = _build_paths(model_label, run_name, n_samples, temperature)
     steer_mode = "none"
-    print(f"[{steer_mode}] Running pass@k grading ({lcb_num_process_evaluate} workers) ...")
     eval_samples = [p.get_evaluation_sample() for p in benchmark_sorted]
-    metrics_tuple = codegen_metrics(
-        eval_samples,
-        all_extracted,
-        num_process_evaluate=lcb_num_process_evaluate,
-        timeout=lcb_timeout,
-    )
-    metrics, results_dict, metadatas = metrics_tuple
-    graded = extract_instance_results(results_dict)
+    n_prob = len(benchmark_sorted)
+
+    if eval_debug:
+        print(
+            f"[{steer_mode}] DEBUG pass@k: one problem at a time "
+            f"({n_prob} problems, {lcb_num_process_evaluate} workers per chunk) ...",
+            flush=True,
+        )
+        _log_memory("evaluate_debug start")
+        merged_results: dict = {}
+        merged_final_metadata: List = []
+        for pi, problem in enumerate(benchmark_sorted):
+            sep = "=" * 72
+            print(f"\n{sep}\n[eval_debug] problem {pi + 1}/{n_prob}  question_id={problem.question_id}\n{sep}", flush=True)
+            _log_memory(f"before problem {pi} qid={problem.question_id}")
+            desc = (problem.question_content or "").strip()
+            print("[eval_debug] DESCRIPTION:\n" + _truncate(desc, eval_debug_desc_chars) + "\n", flush=True)
+            for si, code in enumerate(all_extracted[pi]):
+                print(
+                    f"[eval_debug] EXTRACTED sample {si + 1}/{n_samples}:\n"
+                    + _truncate((code or "").strip(), eval_debug_code_chars)
+                    + "\n",
+                    flush=True,
+                )
+                if eval_debug_print_raw_outputs:
+                    raw = (all_outputs[pi][si] if si < len(all_outputs[pi]) else "") or ""
+                    print(
+                        f"[eval_debug] RAW model output sample {si + 1}/{n_samples}:\n"
+                        + _truncate(raw.strip(), eval_debug_code_chars)
+                        + "\n",
+                        flush=True,
+                    )
+            _log_memory(f"after prints problem {pi}")
+
+            try:
+                metrics_tuple = codegen_metrics(
+                    [eval_samples[pi]],
+                    [all_extracted[pi]],
+                    k_list=_LCB_K_LIST,
+                    num_process_evaluate=lcb_num_process_evaluate,
+                    timeout=lcb_timeout,
+                )
+            except BaseException as exc:
+                print(
+                    f"[eval_debug] FAILED during codegen_metrics at pi={pi} "
+                    f"question_id={problem.question_id}: {exc!r}",
+                    flush=True,
+                )
+                raise
+            _partial_metrics, results_partial, meta_partial = metrics_tuple
+            merged_results[pi] = results_partial[0]
+            merged_final_metadata.extend(meta_partial)
+            _log_memory(f"after grading problem {pi} qid={problem.question_id}")
+            del metrics_tuple, results_partial, meta_partial, _partial_metrics
+            gc.collect()
+
+        metrics = compute_metrics_from_results(merged_results, k_list=_LCB_K_LIST)
+        graded = extract_instance_results(merged_results)
+        metadatas = merged_final_metadata
+    else:
+        print(f"[{steer_mode}] Running pass@k grading ({lcb_num_process_evaluate} workers) ...")
+        metrics_tuple = codegen_metrics(
+            eval_samples,
+            all_extracted,
+            k_list=_LCB_K_LIST,
+            num_process_evaluate=lcb_num_process_evaluate,
+            timeout=lcb_timeout,
+        )
+        metrics, results_dict, metadatas = metrics_tuple
+        graded = extract_instance_results(results_dict)
+
     save_eval_results = [
         p.insert_output_evaluation(o, c, g, metadata=m)
         for p, o, c, g, m in zip(benchmark_sorted, all_outputs, all_extracted, graded, metadatas)
@@ -505,6 +610,32 @@ if __name__ == "__main__":
     p_eval.add_argument("--run_name", type=str, default="norun")
     p_eval.add_argument("--lcb_num_process_evaluate", type=int, default=4)
     p_eval.add_argument("--lcb_timeout", type=int, default=6)
+    p_eval.add_argument(
+        "--eval_debug",
+        action="store_true",
+        help=(
+            "Grade one LCB problem at a time: print RSS memory, problem description, and each extracted "
+            "solution before grading that problem (use with tee logs to see where crashes occur). "
+            "Much slower; use --lcb_num_process_evaluate 1 for easiest logs."
+        ),
+    )
+    p_eval.add_argument(
+        "--eval_debug_desc_chars",
+        type=int,
+        default=4000,
+        help="Max chars of problem description to print per problem (0 = unlimited).",
+    )
+    p_eval.add_argument(
+        "--eval_debug_code_chars",
+        type=int,
+        default=12000,
+        help="Max chars per extracted (or raw) solution sample (0 = unlimited).",
+    )
+    p_eval.add_argument(
+        "--eval_debug_raw_outputs",
+        action="store_true",
+        help="Also print full raw model outputs (before fence extraction) for each sample.",
+    )
 
     p_all = subparsers.add_parser("all", help="Run generation then evaluation.")
     p_all.add_argument("--seed", type=int, default=42)
@@ -560,6 +691,10 @@ if __name__ == "__main__":
             run_name=args.run_name,
             lcb_num_process_evaluate=args.lcb_num_process_evaluate,
             lcb_timeout=args.lcb_timeout,
+            eval_debug=args.eval_debug,
+            eval_debug_desc_chars=args.eval_debug_desc_chars,
+            eval_debug_code_chars=args.eval_debug_code_chars,
+            eval_debug_print_raw_outputs=args.eval_debug_raw_outputs,
         )
     else:
         results = run_codecontests_evaluation_for_llama_instruct(

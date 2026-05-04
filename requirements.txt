@@ -2,6 +2,7 @@ accelerate
 datasets==3.5.0
 lightning
 numpy
+psutil
 pandas
 peft
 protobuf
