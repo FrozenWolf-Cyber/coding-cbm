@@ -54,6 +54,102 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # This script only runs the HuggingFace deepmind/code_contests pipeline (no dataset switch).
 DATASET = "code_contests"
 
+
+def _select_random_python_solution(solutions_obj, row_idx: int, seed: int) -> str:
+    """Pick one random Python solution (PY2=1 or PY3=3) for LM target text."""
+    if not isinstance(solutions_obj, dict):
+        return ""
+    if "language" not in solutions_obj or "solution" not in solutions_obj:
+        return ""
+    languages = solutions_obj["language"] or []
+    texts = solutions_obj["solution"] or []
+    if not isinstance(languages, list) or not isinstance(texts, list):
+        return ""
+
+    py_candidates = [
+        sol for lang, sol in zip(languages, texts)
+        if lang in (1, 3) and isinstance(sol, str) and sol.strip()
+    ]
+    if not py_candidates:
+        return ""
+
+    rng = np.random.default_rng(seed + int(row_idx))
+    pick = int(rng.integers(low=0, high=len(py_candidates)))
+    return py_candidates[pick]
+
+
+def _tokenize_supervised_row(row, row_idx: int, tokenizer, args):
+    """One row of former batched _tok_train / _tok_valid (identical logic)."""
+    desc = (row.get("description") or "").strip()
+    sols = row["solutions"]
+    user_body = build_lcb_user_prompt(
+        problem_description=desc,
+        starter_code="",
+        language="python",
+    )
+    solution = _select_random_python_solution(sols, row_idx=row_idx, seed=args.seed)
+    assistant_body = f"```python\n{solution}\n```" if solution else ""
+    prompt_only = format_lcb_llama3_instruct_prompt(
+        tokenizer=tokenizer,
+        problem_description=desc,
+        starter_code="",
+        language="python",
+    )
+    prompt_ids = tokenizer(
+        prompt_only,
+        truncation=True,
+        max_length=args.max_length,
+    )["input_ids"]
+    assistant_start = min(len(prompt_ids), args.max_length)
+    messages = [
+        {"role": "system", "content": "You are an expert Python programmer. You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests."},
+        {"role": "user", "content": user_body},
+        {"role": "assistant", "content": assistant_body},
+    ]
+    formatted = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        continue_final_message=False,
+    )
+    enc = tokenizer(
+        formatted,
+        truncation=True,
+        max_length=args.max_length,
+    )
+    attn_mask = enc["attention_mask"]
+    lm_mask = []
+    for i in range(len(attn_mask) - 1):
+        label_pos = i + 1
+        use_label = int(attn_mask[label_pos] == 1 and label_pos >= assistant_start)
+        lm_mask.append(use_label)
+    return {
+        "input_ids": torch.tensor(enc["input_ids"], dtype=torch.long),
+        "attention_mask": torch.tensor(enc["attention_mask"], dtype=torch.long),
+        "loss_mask": torch.tensor(lm_mask, dtype=torch.long),
+    }
+
+
+def _tokenize_eval_row(row, tokenizer, args):
+    """One row of former batched _tok_eval."""
+    desc = (row.get("description") or "").strip()
+    prompt = format_lcb_llama3_instruct_prompt(
+        tokenizer=tokenizer,
+        problem_description=desc,
+        starter_code="",
+        language="python",
+    )
+    enc = tokenizer(
+        prompt,
+        truncation=True,
+        max_length=args.max_length,
+    )
+    return {
+        "input_ids": torch.tensor(enc["input_ids"], dtype=torch.long),
+        "attention_mask": torch.tensor(enc["attention_mask"], dtype=torch.long),
+    }
+
+
 parser.add_argument(
     "--max_train_samples",
     type=int,
@@ -333,30 +429,32 @@ parser.add_argument(
 )
 
 
-class ClassificationDataset(torch.utils.data.Dataset):
-    """Thin wrapper around a HF Dataset + numpy supervision array.
+class LazyTokenizedClassificationDataset(torch.utils.data.Dataset):
+    """HF row dataset + supervision; tokenizes in __getitem__ to avoid materializing all token ids.
 
-    train_combined_finegrained.py previously assumed `encoded_text` was a dict of lists.
-    Here `encoded_text` is a `datasets.Dataset`, so we index per-row.
+    `mode` is either ``"train"`` / ``"valid"`` (supervised chat + loss_mask) or ``"test"`` (prompt-only,
+    no reference solution — same distinction as former _tok_train/_tok_valid vs _tok_eval).
     """
 
-    def __init__(self, encoded_dataset, s):
-        self.encoded_dataset = encoded_dataset
+    def __init__(self, raw_dataset, s, mode: str, tokenizer, args):
+        self.raw_dataset = raw_dataset
         self.s = s
+        self.mode = mode
+        self.tokenizer = tokenizer
+        self.args = args
 
     def __getitem__(self, idx):
-        row = self.encoded_dataset[int(idx)]
-        t = {
-            "input_ids": torch.tensor(row["input_ids"], dtype=torch.long),
-            "attention_mask": torch.tensor(row["attention_mask"], dtype=torch.long),
-        }
-        if "loss_mask" in row:
-            t["loss_mask"] = torch.tensor(row["loss_mask"], dtype=torch.long)
+        row = self.raw_dataset[int(idx)]
+        if self.mode == "test":
+            t = _tokenize_eval_row(row, self.tokenizer, self.args)
+        else:
+            # train and valid share supervised formatting (historically identical _tok_train / _tok_valid).
+            t = _tokenize_supervised_row(row, int(idx), self.tokenizer, self.args)
         y = torch.tensor(self.s[int(idx)], dtype=torch.float32)
         return t, y
 
     def __len__(self):
-        return len(self.encoded_dataset)
+        return len(self.raw_dataset)
 
 
 def _dynamic_padding_collate(batch):
@@ -405,8 +503,8 @@ def _dynamic_padding_collate(batch):
     return out_text, out_sim
 
 
-def build_loaders(encoded_dataset, s, mode):
-    dataset = ClassificationDataset(encoded_dataset, s)
+def build_loaders(raw_hf_dataset, s, mode, tokenizer, args):
+    dataset = LazyTokenizedClassificationDataset(raw_hf_dataset, s, mode, tokenizer, args)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -468,11 +566,7 @@ if __name__ == "__main__":
         texts = solutions["solution"] or []
         return any(lang in (1, 3) and isinstance(sol, str) and sol.strip() for lang, sol in zip(languages, texts))
 
-    # For debug only: keep an unsampled copy to compute full-train pre-truncation stats.
     train_dataset_for_length_stats = None
-    if debug_mode:
-        train_dataset_for_length_stats = raw_dataset["train"].filter(_has_valid_cf_tag)
-        train_dataset_for_length_stats = train_dataset_for_length_stats.filter(_has_python_solution)
 
     if args.max_train_samples > 0:
         train_dataset_raw = train_dataset_raw.select(range(min(args.max_train_samples, len(train_dataset_raw))))
@@ -540,7 +634,7 @@ if __name__ == "__main__":
     valid_dataset = valid_dataset_raw
     test_dataset  = test_dataset_raw
 
-    print("tokenizing...")
+    print("lazy tokenization (runs during DataLoader sampling; no upfront token-id cache).")
 
     lora_config = LoraConfig(
         r=8,
@@ -553,243 +647,29 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID)
     tokenizer.pad_token = tokenizer.eos_token
 
-    def _select_random_python_solution(solutions_obj, row_idx: int) -> str:
-        """Pick one random Python solution (PY2=1 or PY3=3) for LM target text."""
-        if not isinstance(solutions_obj, dict):
-            return ""
-        if "language" not in solutions_obj or "solution" not in solutions_obj:
-            return ""
-        languages = solutions_obj["language"] or []
-        texts = solutions_obj["solution"] or []
-        if not isinstance(languages, list) or not isinstance(texts, list):
-            return ""
+    tokenization_elapsed = 0.0
 
-        py_candidates = [
-            sol for lang, sol in zip(languages, texts)
-            if lang in (1, 3) and isinstance(sol, str) and sol.strip()
-        ]
-        if not py_candidates:
-            return ""
-
-        rng = np.random.default_rng(args.seed + int(row_idx))
-        pick = int(rng.integers(low=0, high=len(py_candidates)))
-        return py_candidates[pick]
-
-    def _tok_train(batch, indices):
-        descriptions = batch["description"]
-        solutions_all = batch["solutions"]
-        formatted = []
-        assistant_starts = []
-        for desc, sols, row_idx in zip(descriptions, solutions_all, indices):
-            desc = (desc or "").strip()
-            user_body = build_lcb_user_prompt(
-                problem_description=desc,
-                starter_code="",
-                language="python",
-            )
-            solution = _select_random_python_solution(sols, row_idx=row_idx)
-            assistant_body = f"```python\n{solution}\n```" if solution else ""
-            prompt_only = format_lcb_llama3_instruct_prompt(
-                tokenizer=tokenizer,
-                problem_description=desc,
-                starter_code="",
-                language="python",
-            )
-            prompt_ids = tokenizer(
-                prompt_only,
-                truncation=True,
-                max_length=args.max_length,
-            )["input_ids"]
-            assistant_starts.append(min(len(prompt_ids), args.max_length))
-            messages = [
-                {"role": "system", "content": "You are an expert Python programmer. You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests."},
-                {"role": "user", "content": user_body},
-                {"role": "assistant", "content": assistant_body},
-            ]
-            formatted.append(
-                tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                    continue_final_message=False,
-                )
-            )
-        enc = tokenizer(
-            formatted,
-            truncation=True,
-            max_length=args.max_length,
-        )
-        loss_masks = []
-        for attn_mask, assistant_start in zip(enc["attention_mask"], assistant_starts):
-            # Shifted LM labels predict token i+1 from token i; supervise only assistant tokens.
-            lm_mask = []
-            for i in range(len(attn_mask) - 1):
-                label_pos = i + 1
-                use_label = int(attn_mask[label_pos] == 1 and label_pos >= assistant_start)
-                lm_mask.append(use_label)
-            loss_masks.append(lm_mask)
-        enc["loss_mask"] = loss_masks
-        return enc
-
-    def _tok_valid(batch, indices):
-        descriptions = batch["description"]
-        solutions_all = batch["solutions"]
-        formatted = []
-        assistant_starts = []
-        for desc, sols, row_idx in zip(descriptions, solutions_all, indices):
-            desc = (desc or "").strip()
-            user_body = build_lcb_user_prompt(
-                problem_description=desc,
-                starter_code="",
-                language="python",
-            )
-            solution = _select_random_python_solution(sols, row_idx=row_idx)
-            assistant_body = f"```python\n{solution}\n```" if solution else ""
-            prompt_only = format_lcb_llama3_instruct_prompt(
-                tokenizer=tokenizer,
-                problem_description=desc,
-                starter_code="",
-                language="python",
-            )
-            prompt_ids = tokenizer(
-                prompt_only,
-                truncation=True,
-                max_length=args.max_length,
-            )["input_ids"]
-            assistant_starts.append(min(len(prompt_ids), args.max_length))
-            messages = [
-                {"role": "system", "content": "You are an expert Python programmer. You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests."},
-                {"role": "user", "content": user_body},
-                {"role": "assistant", "content": assistant_body},
-            ]
-            formatted.append(
-                tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                    continue_final_message=False,
-                )
-            )
-        enc = tokenizer(
-            formatted,
-            truncation=True,
-            max_length=args.max_length,
-        )
-        loss_masks = []
-        for attn_mask, assistant_start in zip(enc["attention_mask"], assistant_starts):
-            lm_mask = []
-            for i in range(len(attn_mask) - 1):
-                label_pos = i + 1
-                use_label = int(attn_mask[label_pos] == 1 and label_pos >= assistant_start)
-                lm_mask.append(use_label)
-            loss_masks.append(lm_mask)
-        enc["loss_mask"] = loss_masks
-        return enc
-
-    def _tok_eval(batch):
-        descriptions = batch["description"]
-        prompts = [
-            format_lcb_llama3_instruct_prompt(
-                tokenizer=tokenizer,
-                problem_description=(desc or "").strip(),
-                starter_code="",
-                language="python",
-            )
-            for desc in descriptions
-        ]
-        return tokenizer(
-            prompts,
-            truncation=True,
-            max_length=args.max_length,
-        )
-
-    def _full_train_untruncated_len_batch(batch, indices):
-        descriptions = batch["description"]
-        solutions_all = batch["solutions"]
-        lengths = []
-        for desc, sols, row_idx in zip(descriptions, solutions_all, indices):
-            desc = (desc or "").strip()
-            user_body = build_lcb_user_prompt(
-                problem_description=desc,
-                starter_code="",
-                language="python",
-            )
-            solution = _select_random_python_solution(sols, row_idx=row_idx)
-            assistant_body = f"```python\n{solution}\n```" if solution else ""
-            messages = [
-                {"role": "system", "content": "You are an expert Python programmer. You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests."},
-                {"role": "user", "content": user_body},
-                {"role": "assistant", "content": assistant_body},
-            ]
-            full_text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-                continue_final_message=False,
-            )
-            token_ids = tokenizer(full_text, truncation=False)["input_ids"]
-            lengths.append(len(token_ids))
-        return {"full_train_untruncated_len": lengths}
-
-    tokenization_start = time.time()
-    if debug_mode and (train_dataset_for_length_stats is not None):
-        print("computing full-train pre-truncation token length stats (debug mode only)...")
-        full_train_len_stats_dataset = train_dataset_for_length_stats.map(
-            _full_train_untruncated_len_batch,
-            batched=True,
-            with_indices=True,
-            batch_size=256,
-        )
-        if len(full_train_len_stats_dataset) > 0:
-            full_train_len_arr = np.asarray(full_train_len_stats_dataset["full_train_untruncated_len"], dtype=np.int32)
-            print(
-                "full train pre-truncation token length stats | "
-                f"min: {int(full_train_len_arr.min())}, "
-                f"mean: {float(full_train_len_arr.mean()):.2f}, "
-                f"median: {float(np.median(full_train_len_arr)):.2f}, "
-                f"max: {int(full_train_len_arr.max())}"
-            )
-            del full_train_len_arr
-        del full_train_len_stats_dataset
-        del train_dataset_for_length_stats
-        train_dataset_for_length_stats = None
-        gc.collect()
-    encoded_train_dataset = train_dataset.map(_tok_train, batched=True, with_indices=True, batch_size=1024)
-    encoded_valid_dataset = valid_dataset.map(_tok_valid, batched=True, with_indices=True, batch_size=1024)
-    encoded_test_dataset = test_dataset.map(_tok_eval, batched=True, batch_size=1024)
-    tokenization_elapsed = time.time() - tokenization_start
-
-    # Keep only tensors (no label column in code_contests encoded datasets)
-    keep_cols_train = {"input_ids", "attention_mask", "loss_mask"}
-    keep_cols_valid = {"input_ids", "attention_mask", "loss_mask"}
-    keep_cols_eval = {"input_ids", "attention_mask"}
-    encoded_train_dataset = encoded_train_dataset.remove_columns([c for c in encoded_train_dataset.column_names if c not in keep_cols_train])
-    encoded_valid_dataset = encoded_valid_dataset.remove_columns([c for c in encoded_valid_dataset.column_names if c not in keep_cols_valid])
-    encoded_test_dataset = encoded_test_dataset.remove_columns([c for c in encoded_test_dataset.column_names if c not in keep_cols_eval])
-
-    # Raw HF splits are fully materialized in encoded_*; release before loading Llama (large for debug + prod).
-    # Keep test_dataset for final code_contests eval; drop duplicate alias test_dataset_raw.
+    # Raw HF row splits are tokenized lazily in DataLoader workers; release the umbrella dataset handle only.
     del raw_dataset
-    del train_dataset_raw, valid_dataset_raw, train_dataset, valid_dataset
-    del test_dataset_raw
+    del train_dataset_raw, valid_dataset_raw, test_dataset_raw
     gc.collect()
 
     # concept_set already built above from CF tags; concept_set_for_similarity == concept_set
     print("concept len: ", len(concept_set))
     hm_stats = _format_host_memory_stats()
     if hm_stats:
-        print(f"[post-tokenize] {hm_stats}", flush=True)
+        print(f"[post-data-prep] {hm_stats}", flush=True)
 
     d_name = DATASET.replace('/', '_')
     label_prefix = "./"   # unused for code_contests (supervision built directly from CF tags)
     # val_similarity already set above (None unless you want to add valid split eval)
 
-    # Require exact alignment between concept-label rows and tokenized dataset rows.
-    assert int(np.asarray(train_similarity).shape[0]) == len(encoded_train_dataset), (
-        f"train: concept-label rows ({int(np.asarray(train_similarity).shape[0])}) != tokenized dataset rows ({len(encoded_train_dataset)})"
+    # Require exact alignment between concept-label rows and HF row datasets (lazy tokenization).
+    assert int(np.asarray(train_similarity).shape[0]) == len(train_dataset), (
+        f"train: concept-label rows ({int(np.asarray(train_similarity).shape[0])}) != dataset rows ({len(train_dataset)})"
     )
-    assert int(np.asarray(val_similarity).shape[0]) == len(encoded_valid_dataset), (
-        f"valid: concept-label rows ({int(np.asarray(val_similarity).shape[0])}) != tokenized dataset rows ({len(encoded_valid_dataset)})"
+    assert int(np.asarray(val_similarity).shape[0]) == len(valid_dataset), (
+        f"valid: concept-label rows ({int(np.asarray(val_similarity).shape[0])}) != dataset rows ({len(valid_dataset)})"
     )
 
     # Basic shape sanity checks.
@@ -804,13 +684,13 @@ if __name__ == "__main__":
 
     print("creating loader...")
     loader_start = time.time()
-    train_loader = build_loaders(encoded_train_dataset, train_similarity, mode="train")
-    valid_loader = build_loaders(encoded_valid_dataset, val_similarity, mode="valid")
+    train_loader = build_loaders(train_dataset, train_similarity, "train", tokenizer, args)
+    valid_loader = build_loaders(valid_dataset, val_similarity, "valid", tokenizer, args)
 
     # test_loader is used for post-training analyses.
     # Supervision is multi-hot from CF tags (already built as test_similarity_for_eval).
-    test_dummy_sim = np.zeros((len(encoded_test_dataset), len(concept_set)), dtype=np.float32)
-    test_loader = build_loaders(encoded_test_dataset, test_dummy_sim, mode="test")
+    test_dummy_sim = np.zeros((len(test_dataset), len(concept_set)), dtype=np.float32)
+    test_loader = build_loaders(test_dataset, test_dummy_sim, "test", tokenizer, args)
     loader_elapsed = time.time() - loader_start
     data_loading_elapsed = time.time() - data_loading_start
     print(
@@ -1323,7 +1203,7 @@ if __name__ == "__main__":
     if not args.skip_code_final_test:
         try:
             print(
-                "[pre-code-eval] Dropping training loaders / encoded splits / similarity matrices "
+                "[pre-code-eval] Dropping training loaders / HF train & valid splits / similarity matrices "
                 "and duplicate dataset handles (test split held in a single ref for code_contests) ...",
                 flush=True,
             )
@@ -1331,9 +1211,9 @@ if __name__ == "__main__":
                 del train_dataset_for_length_stats
                 train_dataset_for_length_stats = None
             del train_loader, valid_loader, test_loader
-            del encoded_train_dataset, encoded_valid_dataset, encoded_test_dataset
+            del train_dataset, valid_dataset
             del train_similarity, val_similarity, test_similarity_for_eval, test_dummy_sim
-            # train/valid/test raw HF handles were dropped after tokenization; only test_dataset remains for code eval.
+            # train/valid row datasets released; test split kept for code_contests eval below.
             _code_eval_test_holder = [test_dataset]
             del test_dataset
             gc.collect()
