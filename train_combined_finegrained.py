@@ -776,6 +776,9 @@ if __name__ == "__main__":
 
     # concept_set already built above from CF tags; concept_set_for_similarity == concept_set
     print("concept len: ", len(concept_set))
+    hm_stats = _format_host_memory_stats()
+    if hm_stats:
+        print(f"[post-tokenize] {hm_stats}", flush=True)
 
     d_name = DATASET.replace('/', '_')
     label_prefix = "./"   # unused for code_contests (supervision built directly from CF tags)
