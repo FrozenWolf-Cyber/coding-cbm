@@ -749,6 +749,11 @@ if __name__ == "__main__":
                 f"median: {float(np.median(full_train_len_arr)):.2f}, "
                 f"max: {int(full_train_len_arr.max())}"
             )
+            del full_train_len_arr
+        del full_train_len_stats_dataset
+        del train_dataset_for_length_stats
+        train_dataset_for_length_stats = None
+        gc.collect()
     encoded_train_dataset = train_dataset.map(_tok_train, batched=True, with_indices=True, batch_size=1024)
     encoded_valid_dataset = valid_dataset.map(_tok_valid, batched=True, with_indices=True, batch_size=1024)
     encoded_test_dataset = test_dataset.map(_tok_eval, batched=True, batch_size=1024)
@@ -761,6 +766,13 @@ if __name__ == "__main__":
     encoded_train_dataset = encoded_train_dataset.remove_columns([c for c in encoded_train_dataset.column_names if c not in keep_cols_train])
     encoded_valid_dataset = encoded_valid_dataset.remove_columns([c for c in encoded_valid_dataset.column_names if c not in keep_cols_valid])
     encoded_test_dataset = encoded_test_dataset.remove_columns([c for c in encoded_test_dataset.column_names if c not in keep_cols_eval])
+
+    # Raw HF splits are fully materialized in encoded_*; release before loading Llama (large for debug + prod).
+    # Keep test_dataset for final code_contests eval; drop duplicate alias test_dataset_raw.
+    del raw_dataset
+    del train_dataset_raw, valid_dataset_raw, train_dataset, valid_dataset
+    del test_dataset_raw
+    gc.collect()
 
     # concept_set already built above from CF tags; concept_set_for_similarity == concept_set
     print("concept len: ", len(concept_set))
@@ -809,6 +821,7 @@ if __name__ == "__main__":
     print("preparing backbone")
     preLM = LlamaModel.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID, torch_dtype=torch.bfloat16).to(device)
     preLM = get_peft_model(preLM, lora_config)
+    del lora_config
     preLM.print_trainable_parameters()
     lora_layers = filter(lambda p: p.requires_grad, preLM.parameters())
     opt_prelm = torch.optim.Adam(lora_layers, lr=5e-5)
@@ -1188,6 +1201,7 @@ if __name__ == "__main__":
             )
             wandb_log(val_log)
             avg_metrics.update(val_log)
+            del val_preds, val_targets, val_pred_tensor, val_target_tensor
 
         # Track and save best checkpoint by total averaged training objective.
         # (No validation loop exists in this script yet, so "best" is train-loss based.)
@@ -1316,13 +1330,9 @@ if __name__ == "__main__":
             del train_loader, valid_loader, test_loader
             del encoded_train_dataset, encoded_valid_dataset, encoded_test_dataset
             del train_similarity, val_similarity, test_similarity_for_eval, test_dummy_sim
-            del train_dataset, valid_dataset
-            # Aliases to the same Dataset objects as train_dataset / valid_dataset / test_dataset — drop all names.
-            del train_dataset_raw, valid_dataset_raw
-            # HuggingFace DatasetDict for code_contests — no longer needed after encoded splits are gone.
-            del raw_dataset
+            # train/valid/test raw HF handles were dropped after tokenization; only test_dataset remains for code eval.
             _code_eval_test_holder = [test_dataset]
-            del test_dataset, test_dataset_raw
+            del test_dataset
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
