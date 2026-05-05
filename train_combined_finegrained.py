@@ -24,6 +24,7 @@ from utils import (
 )
 from steerability_cache import save_all_steerability_texts, steerability_output_root
 from eval_metrics import (
+    _format_host_memory_stats,
     set_seed,
     get_intervention_value,
     generate_steerability_texts,
@@ -306,6 +307,14 @@ parser.add_argument(
     help=(
         "How many LCB prompts to generate in each GPU batched forward pass "
         "(also used for batched code_contests generation; passed as batch_size to run_codecontests_evaluation_for_cbm)."
+    ),
+)
+parser.add_argument(
+    "--eval_log_host_memory",
+    action="store_true",
+    help=(
+        "Append process RSS + system-used/available RAM to each [eval-mem] line (psutil). "
+        "Enabled automatically with --debug; pass this flag to enable without debug."
     ),
 )
 parser.add_argument(
@@ -1298,7 +1307,7 @@ if __name__ == "__main__":
         try:
             print(
                 "[pre-code-eval] Dropping training loaders / encoded splits / similarity matrices "
-                "(keeping test_dataset for code_contests eval) ...",
+                "and duplicate dataset handles (test split held in a single ref for code_contests) ...",
                 flush=True,
             )
             if train_dataset_for_length_stats is not None:
@@ -1308,9 +1317,20 @@ if __name__ == "__main__":
             del encoded_train_dataset, encoded_valid_dataset, encoded_test_dataset
             del train_similarity, val_similarity, test_similarity_for_eval, test_dummy_sim
             del train_dataset, valid_dataset
+            # Aliases to the same Dataset objects as train_dataset / valid_dataset / test_dataset — drop all names.
+            del train_dataset_raw, valid_dataset_raw
+            # HuggingFace DatasetDict for code_contests — no longer needed after encoded splits are gone.
+            del raw_dataset
+            _code_eval_test_holder = [test_dataset]
+            del test_dataset, test_dataset_raw
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            eval_log_host_memory = bool(debug_mode or args.eval_log_host_memory)
+            if eval_log_host_memory:
+                hm = _format_host_memory_stats()
+                if hm:
+                    print(f"[pre-code-eval] {hm}", flush=True)
             print("[pre-code-eval] gc/cuda done; calling run_codecontests_evaluation_for_cbm ...", flush=True)
 
             lcb_steer_modes = [m.strip() for m in args.lcb_steer_modes.split(",") if m.strip()]
@@ -1320,7 +1340,7 @@ if __name__ == "__main__":
                 cbl=cbl,
                 tokenizer=tokenizer,
                 concept_set=concept_set,
-                test_dataset=test_dataset,
+                test_dataset_holder=_code_eval_test_holder,
                 batch_size=args.lcb_prompt_batch_size,
                 seed=args.seed,
                 model_label=f"CBM-Llama3-{DATASET}",
@@ -1349,6 +1369,7 @@ if __name__ == "__main__":
                 lcb_timeout=args.lcb_timeout,
                 print_extracted_code_preview=args.print_extracted_code_preview,
                 extracted_preview_chars=args.extracted_preview_chars,
+                eval_log_host_memory=eval_log_host_memory,
             )
         except Exception as code_eval_err:
             import traceback
