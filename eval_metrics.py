@@ -525,6 +525,7 @@ def run_codecontests_evaluation_for_cbm(
             cc_dir = base_root / "code_contests" / mode_label
             cc_dir.mkdir(parents=True, exist_ok=True)
             out_path = cc_dir / f"l{layer_idx}-seed{seed}-{run_id}.jsonl"
+            cc_total_prompts = sum(1 for idx in range(len(_cc_td)) if str(_cc_td[idx].get("description", "")).strip())
 
             print(f"\n[{steer_mode}] Generating solutions for code_contests test set ...", flush=True)
             cc_generation_start_t = time.perf_counter()
@@ -539,6 +540,8 @@ def run_codecontests_evaluation_for_cbm(
             def _flush_cc_batch():
                 if not pending_prompts:
                     return
+                flush_batch_size = len(pending_prompts)
+                flush_start_t = time.perf_counter()
                 generated = _generate_solutions_batched(
                     preLM,
                     cbl,
@@ -577,6 +580,14 @@ def run_codecontests_evaluation_for_cbm(
                 pending_prompts.clear()
                 pending_intervenes.clear()
                 pending_meta_rows.clear()
+                flush_elapsed = time.perf_counter() - flush_start_t
+                cc_done = len(rows)
+                cc_left = max(0, cc_total_prompts - cc_done)
+                print(
+                    f"[eval-timing] code_contests/{steer_mode}: flush_generation="
+                    f"{_fmt_seconds(flush_elapsed)} | batch={flush_batch_size} | done={cc_done}/{cc_total_prompts} | left={cc_left}",
+                    flush=True,
+                )
                 del generated
 
             for i in tqdm(range(len(_cc_td)), desc=f"cc/{steer_mode}", disable=not display):
@@ -742,6 +753,7 @@ def run_codecontests_evaluation_for_cbm(
         all_outputs: List[List[str]] = []
         all_extracted: List[List[str]] = []
         benchmark_sorted = sorted(benchmark, key=lambda x: x.question_id)
+        lcb_total_prompts = len(benchmark_sorted)
         prompt_batch_size = max(1, int(batch_size))
         pending_lcb_prompts: List[str] = []
         pending_lcb_intervenes: List[Optional[List[float]]] = []
@@ -750,6 +762,8 @@ def run_codecontests_evaluation_for_cbm(
         def _flush_lcb_batch():
             if not pending_lcb_prompts:
                 return
+            flush_batch_size = len(pending_lcb_prompts)
+            flush_start_t = time.perf_counter()
             generated = _generate_solutions_batched(
                 preLM,
                 cbl,
@@ -779,6 +793,14 @@ def run_codecontests_evaluation_for_cbm(
             pending_lcb_prompts.clear()
             pending_lcb_intervenes.clear()
             pending_lcb_headings.clear()
+            flush_elapsed = time.perf_counter() - flush_start_t
+            lcb_done = len(all_outputs)
+            lcb_left = max(0, lcb_total_prompts - lcb_done)
+            print(
+                f"[eval-timing] livecodebench/{steer_mode}: flush_generation="
+                f"{_fmt_seconds(flush_elapsed)} | batch={flush_batch_size} | done={lcb_done}/{lcb_total_prompts} | left={lcb_left}",
+                flush=True,
+            )
             del generated
 
         for problem in tqdm(benchmark_sorted, desc=f"lcb/{steer_mode}", disable=not display):
