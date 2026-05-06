@@ -442,8 +442,6 @@ def run_codecontests_evaluation_for_cbm(
     lcb_top_k: int = 50,
     lcb_max_new_tokens: int = 2000,
     lcb_repetition_penalty: float = 1.05,
-    lcb_num_process_evaluate: int = 4,
-    lcb_timeout: int = 6,
     livecodebench_split: str = "test",
     print_extracted_code_preview: bool = False,
     extracted_preview_chars: int = 420,
@@ -453,20 +451,18 @@ def run_codecontests_evaluation_for_cbm(
     # When True, append process RSS + system used/available to every [eval-mem] line.
     eval_log_host_memory: bool = False,
 ) -> dict:
-    """Generate and evaluate code for both code_contests test set and LiveCodeBench.
+    """Generate code for code_contests and LiveCodeBench and save artifacts.
 
-    Runs each steer_mode independently and logs metrics to wandb under separate keys.
+    Runs each steer_mode independently and logs generation artifacts to wandb.
 
     Steering modes
     --------------
     "none"       : plain CBM forward pass — the apples-to-apples baseline vs LLaMA-3-8B.
     "groundtruth": use CF tags from the dataset to select concept(s) to steer.
 
-    LiveCodeBench comparability
-    ---------------------------
-    Results are saved to  output/{model_label}-{steer_mode}/codegeneration_{n}_{temp}.json
-    (a path that compute_scores.py and the LCB leaderboard tooling can directly consume).
-    Use  --n 10 --temperature 0.2  to match all published baselines.
+    LiveCodeBench generation outputs are saved to
+    output/{model_label}-{steer_mode}/codegeneration_{n}_{temp}.json
+    and an accompanying *_eval.lock.json file consumed by eval_lcb_from_locks.py.
     """
     import json
     from pathlib import Path
@@ -726,7 +722,7 @@ def run_codecontests_evaluation_for_cbm(
     print(f"{'='*60}", flush=True)
     _eval_ck("LiveCodeBench: before _import_lcb / HF dataset load")
 
-    load_code_generation_dataset, codegen_metrics, extract_instance_results = _import_lcb()
+    load_code_generation_dataset, _, _ = _import_lcb()
     _eval_ck("LiveCodeBench: _import_lcb done; calling load_code_generation_dataset ...")
 
     lcb_dataset_start_t = time.perf_counter()
@@ -852,67 +848,39 @@ def run_codecontests_evaluation_for_cbm(
             json.dump(save_results, f, indent=4)
         print(f"  Saved LCB outputs → {lcb_out_path}", flush=True)
         del save_results
-        _eval_ck(f"LCB/{steer_mode}: wrote generations JSON; starting pass@k grading")
-        # ── Grading (pass@k via LCB's codegen_metrics) ──
-        print(f"[{steer_mode}] Running pass@k grading ({lcb_num_process_evaluate} workers) ...", flush=True)
-        lcb_testing_start_t = time.perf_counter()
-        eval_samples = [p.get_evaluation_sample() for p in benchmark_sorted]
-        _eval_mem_line(
-            f"LCB/{steer_mode}: built eval_samples (n={len(eval_samples)}); calling codegen_metrics ...",
-        )
-        metrics_tuple = codegen_metrics(
-            eval_samples,
-            all_extracted,
-            num_process_evaluate=lcb_num_process_evaluate,
-            timeout=lcb_timeout,
-        )
-        _eval_mem_line(f"LCB/{steer_mode}: codegen_metrics returned")
-        lcb_testing_elapsed = time.perf_counter() - lcb_testing_start_t
-        print(
-            f"[eval-timing] livecodebench/{steer_mode}: testing={_fmt_seconds(lcb_testing_elapsed)}",
-            flush=True,
-        )
-        metrics, results_dict, metadatas = metrics_tuple
-        del metrics_tuple
-        graded = extract_instance_results(results_dict)
-        del results_dict
-        save_eval_results = [
-            p.insert_output_evaluation(o, c, g, metadata=m)
-            for p, o, c, g, m in zip(
-                benchmark_sorted, all_outputs, all_extracted, graded, metadatas
-            )
-        ]
-        del graded, metadatas
-        with open(lcb_eval_all_path, "w") as f:
-            json.dump(save_eval_results, f, indent=4)
-        with open(lcb_eval_path, "w") as f:
-            json.dump(metrics, f, indent=4)
-        print(f"  Saved LCB eval → {lcb_eval_all_path}", flush=True)
-        del save_eval_results
-        del eval_samples, all_outputs, all_extracted, benchmark_sorted
-        _eval_ck(f"LCB/{steer_mode}: eval JSON written; dropped large buffers")
-        # ── Log & report ──
-        pass1 = metrics.get("pass@1", float("nan")) if isinstance(metrics, dict) else float("nan")
-        pass5 = metrics.get("pass@5", float("nan")) if isinstance(metrics, dict) else float("nan")
-        print(f"\n  [{steer_mode}] LCB pass@1 = {pass1:.4f}  |  pass@5 = {pass5:.4f}")
-        print(f"  model_repr : {mode_repr}")
-        print(f"  eval_all   : {lcb_eval_all_path}")
+        lock_path = lcb_out_path.with_name(lcb_out_path.name.replace(".json", "_eval.lock.json"))
+        lock_payload = {
+            "status": "pending_eval",
+            "created_at_unix": time.time(),
+            "run_id": str(run_id),
+            "steer_mode": steer_mode,
+            "model_repr": mode_repr,
+            "livecodebench_release": livecodebench_release,
+            "lcb_output_path": str(lcb_out_path),
+            "lcb_eval_path": str(lcb_eval_path),
+            "lcb_eval_all_path": str(lcb_eval_all_path),
+        }
+        with open(lock_path, "w", encoding="utf-8") as f:
+            json.dump(lock_payload, f, indent=2)
+        print(f"  Wrote LCB eval lock → {lock_path}", flush=True)
+        del all_outputs, all_extracted, benchmark_sorted
+        _eval_ck(f"LCB/{steer_mode}: generation-only mode complete")
         log_payload = {
-            f"lcb/{steer_mode}/pass@1": pass1,
-            f"lcb/{steer_mode}/pass@5": pass5,
+            f"lcb/{steer_mode}/generation_only": 1,
             f"lcb/{steer_mode}/n_samples": lcb_n_samples,
             f"lcb/{steer_mode}/temperature": lcb_temperature,
             f"lcb/{steer_mode}/steer_value": steer_value if steer_mode == "groundtruth" else 0.0,
             f"lcb/{steer_mode}/steer_topk": 0,
             f"lcb/{steer_mode}/release": livecodebench_release,
             f"lcb/{steer_mode}/output_path": str(lcb_out_path),
+            f"lcb/{steer_mode}/eval_lock_path": str(lock_path),
         }
         if wandb.run is not None:
             safe_wandb_log(log_payload)
         all_results[f"lcb/{steer_mode}"] = {
-            "pass@1": pass1, "pass@5": pass5,
+            "generation_only": True,
             "output_path": str(lcb_out_path),
-            "eval_all_path": str(lcb_eval_all_path),
+            "eval_lock_path": str(lock_path),
         }
 
     print(
@@ -923,6 +891,76 @@ def run_codecontests_evaluation_for_cbm(
     _eval_ck("run_codecontests_evaluation_for_cbm: LCB complete; benchmark freed")
 
     return all_results
+
+
+def evaluate_saved_livecodebench_generation(
+    lcb_output_path: str,
+    *,
+    livecodebench_release: str,
+    lcb_num_process_evaluate: int = 4,
+    lcb_timeout: int = 6,
+    lcb_eval_path: Optional[str] = None,
+    lcb_eval_all_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Evaluate a previously saved LCB generation JSON and write eval artifacts."""
+    output_path = Path(lcb_output_path)
+    if not output_path.is_file():
+        raise FileNotFoundError(f"LCB generation JSON not found: {output_path}")
+
+    if lcb_eval_path is None:
+        lcb_eval_path = str(output_path.with_name(output_path.name.replace(".json", "_eval.json")))
+    if lcb_eval_all_path is None:
+        lcb_eval_all_path = str(output_path.with_name(output_path.name.replace(".json", "_eval_all.json")))
+
+    load_code_generation_dataset, codegen_metrics, extract_instance_results = _import_lcb()
+    benchmark = load_code_generation_dataset(livecodebench_release)
+    benchmark_sorted = sorted(benchmark, key=lambda x: x.question_id)
+
+    with open(output_path, "r", encoding="utf-8") as f:
+        saved = json.load(f)
+    if len(saved) != len(benchmark_sorted):
+        raise ValueError(
+            f"Saved generations count ({len(saved)}) != benchmark count ({len(benchmark_sorted)})."
+        )
+
+    all_outputs: List[List[str]] = []
+    all_extracted: List[List[str]] = []
+    for row in saved:
+        outputs = row.get("output_list") or row.get("outputs") or []
+        if not isinstance(outputs, list):
+            outputs = []
+        codes = row.get("code_list") or row.get("codes")
+        if isinstance(codes, list):
+            extracted = [str(x) for x in codes]
+        else:
+            extracted = [_extract_code_from_output(str(x)) for x in outputs]
+        all_outputs.append([str(x) for x in outputs])
+        all_extracted.append(extracted)
+
+    eval_samples = [p.get_evaluation_sample() for p in benchmark_sorted]
+    metrics, results_dict, metadatas = codegen_metrics(
+        eval_samples,
+        all_extracted,
+        num_process_evaluate=int(lcb_num_process_evaluate),
+        timeout=int(lcb_timeout),
+    )
+    graded = extract_instance_results(results_dict)
+    save_eval_results = [
+        p.insert_output_evaluation(o, c, g, metadata=m)
+        for p, o, c, g, m in zip(benchmark_sorted, all_outputs, all_extracted, graded, metadatas)
+    ]
+
+    with open(lcb_eval_all_path, "w", encoding="utf-8") as f:
+        json.dump(save_eval_results, f, indent=4)
+    with open(lcb_eval_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=4)
+
+    return {
+        "pass@1": metrics.get("pass@1", float("nan")) if isinstance(metrics, dict) else float("nan"),
+        "pass@5": metrics.get("pass@5", float("nan")) if isinstance(metrics, dict) else float("nan"),
+        "lcb_eval_path": str(lcb_eval_path),
+        "lcb_eval_all_path": str(lcb_eval_all_path),
+    }
 
 
 

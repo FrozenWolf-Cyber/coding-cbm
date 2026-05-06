@@ -290,11 +290,6 @@ parser.add_argument(
     help="Temperature for llama.cpp steerability judge.",
 )
 parser.add_argument(
-    "--skip_code_final_test",
-    action="store_true",
-    help="Skip final code generation + evaluation on code_contests test set.",
-)
-parser.add_argument(
     "--code_results_root",
     type=str,
     default="",
@@ -372,30 +367,6 @@ parser.add_argument(
     type=int,
     default=2000,
     help="Max new tokens for LCB generation (default 2000, same as leaderboard).",
-)
-parser.add_argument(
-    "--lcb_num_process_evaluate",
-    type=int,
-    default=2,
-    help=(
-        "Parallel workers for LCB pass@k grading. "
-        "Lower this on RAM-constrained hosts (for example, 2 on ~64Gi RAM)."
-    ),
-)
-parser.add_argument(
-    "--lcb_timeout",
-    type=int,
-    default=6,
-    help="Per-test-case timeout (seconds) for LCB grading.",
-)
-parser.add_argument(
-    "--lcb_recursion_limit",
-    type=int,
-    default=12000,
-    help=(
-        "Recursion limit injected into sandboxed LiveCodeBench code execution. "
-        "Kept below extreme values to reduce C-stack segfault risk."
-    ),
 )
 parser.add_argument(
     "--lcb_prompt_batch_size",
@@ -542,7 +513,6 @@ if not args.skip_llamacpp_steer_eval:
             f"[eval-timing] llama.cpp dependency_check={time.perf_counter() - llm_dep_start_t:.2f}s",
             flush=True,
         )
-    os.environ.setdefault("LCB_RECURSION_LIMIT", str(args.lcb_recursion_limit))
     set_seed(args.seed)
     debug_mode = args.debug
 
@@ -1217,76 +1187,71 @@ if not args.skip_llamacpp_steer_eval:
     # ── Weight analysis ──
     run_weight_analysis(cbl, concept_set, tokenizer)
 
-    # ── Final test: code_contests test set + LiveCodeBench (unsteered & steered) ──
-    if not args.skip_code_final_test:
-        try:
-            print(
-                "[pre-code-eval] Dropping training loaders / HF train & valid splits / similarity matrices "
-                "and duplicate dataset handles (test split held in a single ref for code_contests) ...",
-                flush=True,
-            )
-            if train_dataset_for_length_stats is not None:
-                del train_dataset_for_length_stats
-                train_dataset_for_length_stats = None
-            del train_loader, valid_loader, test_loader
-            del train_dataset, valid_dataset
-            del train_similarity, val_similarity, test_similarity_for_eval, test_dummy_sim
-            # train/valid row datasets released; test split kept for code_contests eval below.
-            _code_eval_test_holder = [test_dataset]
-            del test_dataset
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            eval_log_host_memory = bool(debug_mode or args.eval_log_host_memory)
-            if eval_log_host_memory:
-                hm = _format_host_memory_stats()
-                if hm:
-                    print(f"[pre-code-eval] {hm}", flush=True)
-            print("[pre-code-eval] gc/cuda done; calling run_codecontests_evaluation_for_cbm ...", flush=True)
+    # ── Final generation: code_contests + LiveCodeBench outputs only (no grading) ──
+    try:
+        print(
+            "[pre-code-eval] Dropping training loaders / HF train & valid splits / similarity matrices "
+            "and duplicate dataset handles (test split held in a single ref for code_contests) ...",
+            flush=True,
+        )
+        if train_dataset_for_length_stats is not None:
+            del train_dataset_for_length_stats
+            train_dataset_for_length_stats = None
+        del train_loader, valid_loader, test_loader
+        del train_dataset, valid_dataset
+        del train_similarity, val_similarity, test_similarity_for_eval, test_dummy_sim
+        # train/valid row datasets released; test split kept for code_contests eval below.
+        _code_eval_test_holder = [test_dataset]
+        del test_dataset
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        eval_log_host_memory = bool(debug_mode or args.eval_log_host_memory)
+        if eval_log_host_memory:
+            hm = _format_host_memory_stats()
+            if hm:
+                print(f"[pre-code-eval] {hm}", flush=True)
+        print("[pre-code-eval] gc/cuda done; calling run_codecontests_evaluation_for_cbm ...", flush=True)
 
-            lcb_steer_modes = [m.strip() for m in args.lcb_steer_modes.split(",") if m.strip()]
-            print(f"Running code generation evaluation  (steer_modes={lcb_steer_modes}) ...")
-            run_codecontests_evaluation_for_cbm(
-                preLM=preLM,
-                cbl=cbl,
-                tokenizer=tokenizer,
-                concept_set=concept_set,
-                test_dataset_holder=_code_eval_test_holder,
-                batch_size=args.lcb_prompt_batch_size,
-                seed=args.seed,
-                model_label=f"CBM-Llama3-{DATASET}",
-                layer_idx=best_epoch,
-                run_id=run_name,
-                # code_contests generation params
-                max_new_tokens=args.code_max_new_tokens,
-                temperature=args.code_temperature,
-                top_p=args.code_top_p,
-                top_k=args.code_top_k,
-                repetition_penalty=args.code_repetition_penalty,
-                results_root=(args.code_results_root or None),
-                llama_vocab_weight=llama_vocab_weight,
-                display=not debug_mode,
-                # Steering
-                steer_modes=lcb_steer_modes,
-                steer_value=get_intervention_value(DATASET),
-                keep_other_concepts=args.intervention_keep_other_concepts,
-                # LiveCodeBench
-                livecodebench_release=args.livecodebench_release,
-                lcb_n_samples=args.lcb_n_samples,
-                lcb_temperature=args.lcb_temperature,
-                lcb_top_p=args.lcb_top_p,
-                lcb_max_new_tokens=args.lcb_max_new_tokens,
-                lcb_num_process_evaluate=args.lcb_num_process_evaluate,
-                lcb_timeout=args.lcb_timeout,
-                print_extracted_code_preview=args.print_extracted_code_preview,
-                extracted_preview_chars=args.extracted_preview_chars,
-                eval_log_host_memory=eval_log_host_memory,
-            )
-        except Exception as code_eval_err:
-            import traceback
-            print(f"Code generation evaluation failed (non-fatal):\n{traceback.format_exc()}")
-    else:
-        print("Skipping final code generation testing.")
+        lcb_steer_modes = [m.strip() for m in args.lcb_steer_modes.split(",") if m.strip()]
+        print(f"Running code generation evaluation  (steer_modes={lcb_steer_modes}) ...")
+        run_codecontests_evaluation_for_cbm(
+            preLM=preLM,
+            cbl=cbl,
+            tokenizer=tokenizer,
+            concept_set=concept_set,
+            test_dataset_holder=_code_eval_test_holder,
+            batch_size=args.lcb_prompt_batch_size,
+            seed=args.seed,
+            model_label=f"CBM-Llama3-{DATASET}",
+            layer_idx=best_epoch,
+            run_id=run_name,
+            # code_contests generation params
+            max_new_tokens=args.code_max_new_tokens,
+            temperature=args.code_temperature,
+            top_p=args.code_top_p,
+            top_k=args.code_top_k,
+            repetition_penalty=args.code_repetition_penalty,
+            results_root=(args.code_results_root or None),
+            llama_vocab_weight=llama_vocab_weight,
+            display=not debug_mode,
+            # Steering
+            steer_modes=lcb_steer_modes,
+            steer_value=get_intervention_value(DATASET),
+            keep_other_concepts=args.intervention_keep_other_concepts,
+            # LiveCodeBench generation
+            livecodebench_release=args.livecodebench_release,
+            lcb_n_samples=args.lcb_n_samples,
+            lcb_temperature=args.lcb_temperature,
+            lcb_top_p=args.lcb_top_p,
+            lcb_max_new_tokens=args.lcb_max_new_tokens,
+            print_extracted_code_preview=args.print_extracted_code_preview,
+            extracted_preview_chars=args.extracted_preview_chars,
+            eval_log_host_memory=eval_log_host_memory,
+        )
+    except Exception as code_eval_err:
+        import traceback
+        print(f"Code generation evaluation failed (non-fatal):\n{traceback.format_exc()}")
 
     # ── Free model from GPU ──
     del preLM, cbl
