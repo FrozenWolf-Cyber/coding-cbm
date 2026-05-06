@@ -36,6 +36,7 @@ from eval_metrics import (
     load_reward_model,
     run_rm_metrics,
     run_steerability_llamacpp_judge,
+    ensure_llamacpp_dependency,
     run_codecontests_evaluation_for_cbm,
 )
 from shared_code_prompt import (
@@ -1291,6 +1292,13 @@ if __name__ == "__main__":
     # ── Steerability scoring (llama.cpp judge) ──
     if not args.skip_llamacpp_steer_eval:
         try:
+            llm_dep_start_t = time.perf_counter()
+            if not ensure_llamacpp_dependency():
+                raise RuntimeError("llama_cpp dependency unavailable after install attempt")
+            print(
+                f"[eval-timing] llama.cpp dependency_check={time.perf_counter() - llm_dep_start_t:.2f}s",
+                flush=True,
+            )
             run_steerability_llamacpp_judge(
                 decoded_texts_by_concept=decoded_texts_by_concept,
                 concept_set=concept_set,

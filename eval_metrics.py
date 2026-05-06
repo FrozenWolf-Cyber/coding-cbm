@@ -15,11 +15,13 @@ from __future__ import annotations
 import gc
 import glob
 import json
+import importlib
 import os
 import pickle
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -107,6 +109,36 @@ def safe_wandb_log(payload):
 
 _CACHED_LLAMA_VOCAB_WEIGHT = None
 CLEANED_TAGS_MAP = pickle.load(open(Path(__file__).parent / "cleaned_tags.pkl", "rb"))
+
+
+def _fmt_seconds(sec: float) -> str:
+    return f"{float(sec):.2f}s"
+
+
+def ensure_llamacpp_dependency() -> bool:
+    """Ensure llama_cpp can be imported; install once if missing."""
+    try:
+        importlib.import_module("llama_cpp")
+        return True
+    except Exception as import_err:
+        print(f"[WARN] llama_cpp import failed: {import_err}")
+        print('Attempting install early: CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python')
+        try:
+            env = os.environ.copy()
+            env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "llama-cpp-python"],
+                env=env,
+            )
+            importlib.import_module("llama_cpp")
+            print("Successfully installed/imported llama_cpp.")
+            return True
+        except Exception as install_err:
+            print(
+                "[WARN] Failed to install/import llama_cpp after retry; "
+                f"llama.cpp evaluation will be skipped: {install_err}"
+            )
+            return False
 
 
 def get_llama_vocab_weight(device):
@@ -442,6 +474,7 @@ def run_codecontests_evaluation_for_cbm(
     preLM.eval()
     cbl.eval()
     set_seed(seed)
+    eval_start_t = time.perf_counter()
 
     if steer_value is None:
         steer_value = float(get_intervention_value("code_contests"))
@@ -494,6 +527,7 @@ def run_codecontests_evaluation_for_cbm(
             out_path = cc_dir / f"l{layer_idx}-seed{seed}-{run_id}.jsonl"
 
             print(f"\n[{steer_mode}] Generating solutions for code_contests test set ...", flush=True)
+            cc_generation_start_t = time.perf_counter()
             rows = []
             concept_pred_rows = []
             concept_target_rows = []
@@ -601,15 +635,21 @@ def run_codecontests_evaluation_for_cbm(
                 if len(pending_prompts) >= prompt_batch_size:
                     _flush_cc_batch()
             _flush_cc_batch()
+            cc_generation_elapsed = time.perf_counter() - cc_generation_start_t
 
             with open(out_path, "w", encoding="utf-8") as f:
                 for row in rows:
                     f.write(json.dumps(row) + "\n")
             print(f"  Saved {len(rows)} solutions → {out_path}", flush=True)
+            print(
+                f"[eval-timing] code_contests/{steer_mode}: generation={_fmt_seconds(cc_generation_elapsed)}",
+                flush=True,
+            )
             _eval_mem_line(
                 f"code_contests/{steer_mode}: jsonl written; computing concept-tag metrics ...",
             )
 
+            cc_testing_start_t = time.perf_counter()
             concept_acc_metrics = {}
             if concept_pred_rows:
                 pred_tensor = torch.stack(concept_pred_rows, dim=0)
@@ -641,6 +681,11 @@ def run_codecontests_evaluation_for_cbm(
                     f"cos_cubed={topk_metrics['cosine_cubed']:.4f}"
                 )
                 del pred_tensor, target_tensor
+            cc_testing_elapsed = time.perf_counter() - cc_testing_start_t
+            print(
+                f"[eval-timing] code_contests/{steer_mode}: testing={_fmt_seconds(cc_testing_elapsed)}",
+                flush=True,
+            )
 
             log_payload = {
                 f"cc/{steer_mode}/solutions_written": len(rows),
@@ -673,8 +718,14 @@ def run_codecontests_evaluation_for_cbm(
     load_code_generation_dataset, codegen_metrics, extract_instance_results = _import_lcb()
     _eval_ck("LiveCodeBench: _import_lcb done; calling load_code_generation_dataset ...")
 
+    lcb_dataset_start_t = time.perf_counter()
     benchmark = load_code_generation_dataset(livecodebench_release)
+    lcb_dataset_elapsed = time.perf_counter() - lcb_dataset_start_t
     print(f"  Loaded {len(benchmark)} LCB problems", flush=True)
+    print(
+        f"[eval-timing] livecodebench: dataset_loading={_fmt_seconds(lcb_dataset_elapsed)}",
+        flush=True,
+    )
     _eval_ck("LiveCodeBench: benchmark loaded")
     for steer_mode in steer_modes:
         # LCB canonical output path mirrors what main.py would produce.
@@ -687,6 +738,7 @@ def run_codecontests_evaluation_for_cbm(
         lcb_eval_all_path = lcb_out_dir / f"codegeneration_{lcb_n_samples}_{lcb_temperature}_eval_all.json"
         # ── Generation ──
         print(f"\n[{steer_mode}] Generating {lcb_n_samples} solutions × {len(benchmark)} LCB problems ...")
+        lcb_generation_start_t = time.perf_counter()
         all_outputs: List[List[str]] = []
         all_extracted: List[List[str]] = []
         benchmark_sorted = sorted(benchmark, key=lambda x: x.question_id)
@@ -732,7 +784,13 @@ def run_codecontests_evaluation_for_cbm(
         for problem in tqdm(benchmark_sorted, desc=f"lcb/{steer_mode}", disable=not display):
             text_for_steer = problem.question_content  # problem statement text
             problem_id = str(problem.question_id)
-            mapped_cf_tags = CLEANED_TAGS_MAP[problem_id]["tags"]
+            mapped_cf_tags = CLEANED_TAGS_MAP.get(problem_id, {}).get("tags", [])
+            if problem_id not in CLEANED_TAGS_MAP and steer_mode == "groundtruth":
+                print(
+                    f"[warn] Missing CLEANED_TAGS_MAP entry for LCB question_id={problem_id}; "
+                    "using empty tags (no steering for this sample).",
+                    flush=True,
+                )
             intervene = _resolve_intervene(
                 steer_mode, text_for_steer, mapped_cf_tags, preLM, cbl, tokenizer,
                 device, concept_set, steer_value,
@@ -754,8 +812,13 @@ def run_codecontests_evaluation_for_cbm(
             if len(pending_lcb_prompts) >= prompt_batch_size:
                 _flush_lcb_batch()
         _flush_lcb_batch()
+        lcb_generation_elapsed = time.perf_counter() - lcb_generation_start_t
         _eval_mem_line(
             f"LCB steer_mode={steer_mode!r}: generation loop finished ({len(all_outputs)} prompt batches)"
+        )
+        print(
+            f"[eval-timing] livecodebench/{steer_mode}: generation={_fmt_seconds(lcb_generation_elapsed)}",
+            flush=True,
         )
         _eval_ck(f"LCB/{steer_mode}: before building save_results JSON")
         # Save in LCB canonical JSON format
@@ -770,6 +833,7 @@ def run_codecontests_evaluation_for_cbm(
         _eval_ck(f"LCB/{steer_mode}: wrote generations JSON; starting pass@k grading")
         # ── Grading (pass@k via LCB's codegen_metrics) ──
         print(f"[{steer_mode}] Running pass@k grading ({lcb_num_process_evaluate} workers) ...", flush=True)
+        lcb_testing_start_t = time.perf_counter()
         eval_samples = [p.get_evaluation_sample() for p in benchmark_sorted]
         _eval_mem_line(
             f"LCB/{steer_mode}: built eval_samples (n={len(eval_samples)}); calling codegen_metrics ...",
@@ -781,6 +845,11 @@ def run_codecontests_evaluation_for_cbm(
             timeout=lcb_timeout,
         )
         _eval_mem_line(f"LCB/{steer_mode}: codegen_metrics returned")
+        lcb_testing_elapsed = time.perf_counter() - lcb_testing_start_t
+        print(
+            f"[eval-timing] livecodebench/{steer_mode}: testing={_fmt_seconds(lcb_testing_elapsed)}",
+            flush=True,
+        )
         metrics, results_dict, metadatas = metrics_tuple
         del metrics_tuple
         graded = extract_instance_results(results_dict)
@@ -824,6 +893,10 @@ def run_codecontests_evaluation_for_cbm(
             "eval_all_path": str(lcb_eval_all_path),
         }
 
+    print(
+        f"[eval-timing] all_code_evaluations_total={_fmt_seconds(time.perf_counter() - eval_start_t)}",
+        flush=True,
+    )
     del benchmark
     _eval_ck("run_codecontests_evaluation_for_cbm: LCB complete; benchmark freed")
 
@@ -1338,26 +1411,9 @@ def run_steerability_llamacpp_judge(
     temperature=0.1,
 ):
     """Judge steerability by classifying generated text to closest concept with llama.cpp."""
-    try:
-        from llama_cpp import Llama
-    except Exception as e:
-        print(f"[WARN] llama_cpp import failed: {e}")
-        print('Attempting install: CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python')
-        try:
-            env = os.environ.copy()
-            env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "llama-cpp-python"],
-                env=env,
-            )
-            from llama_cpp import Llama
-            print("Successfully installed/imported llama_cpp.")
-        except Exception as install_err:
-            print(
-                "[WARN] Failed to install/import llama_cpp after retry; "
-                f"skipping llama.cpp steerability eval: {install_err}"
-            )
-            return {}
+    if not ensure_llamacpp_dependency():
+        return {}
+    Llama = importlib.import_module("llama_cpp").Llama
 
     print(
         f"Loading llama.cpp judge | repo={model_repo_id} file={model_filename} "
