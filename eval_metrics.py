@@ -1763,10 +1763,56 @@ def compute_perplexity(texts: list[str]) -> dict:
     short_texts = [p for p in texts if len(p.split()) <= 30]
 
     def _compute_ppl(predictions: list[str]):
-        kwargs = dict(model_id=LCB_LLAMA3_INSTRUCT_MODEL_ID, max_length=100)
-        metric = evaluate.load("perplexity", module_type="metric")
-        metric.add_batch(predictions=predictions)
-        return metric.compute(**kwargs)["mean_perplexity"]
+        if len(predictions) == 0:
+            return float("nan")
+
+        model_id = LCB_LLAMA3_INSTRUCT_MODEL_ID
+        max_length = 100
+        ppl_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        ppl_tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False)
+        if ppl_tokenizer.pad_token is None:
+            ppl_tokenizer.pad_token = ppl_tokenizer.eos_token
+
+        ppl_model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=(torch.bfloat16 if ppl_device.type == "cuda" else torch.float32),
+        ).to(ppl_device)
+        ppl_model.eval()
+
+        sample_ppls = []
+        with torch.no_grad():
+            for text in tqdm(predictions, desc="Perplexity scoring", leave=False):
+                encoded = ppl_tokenizer(
+                    text,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=max_length,
+                )
+                input_ids = encoded["input_ids"].to(ppl_device)
+                attention_mask = encoded["attention_mask"].to(ppl_device)
+                if input_ids.shape[1] < 2:
+                    continue
+
+                labels = input_ids.clone()
+                labels[attention_mask == 0] = -100
+                out = ppl_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
+                sample_ppls.append(float(torch.exp(out.loss.float()).cpu().item()))
+
+        if len(sample_ppls) == 0:
+            mean_ppl = float("nan")
+        else:
+            mean_ppl = float(np.mean(sample_ppls))
+
+        del ppl_model, ppl_tokenizer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        return mean_ppl
 
     if short_texts:
         ppl_short = _compute_ppl(short_texts)
