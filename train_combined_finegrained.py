@@ -535,6 +535,25 @@ def _hf_from_pretrained_cache_first(loader_fn, model_id: str, cache_dir: str, **
         return loader_fn(model_id, **remote_kwargs)
 
 
+def _zero_cbl_concept_and_unsup_branches_if_requested(cbl_model, enabled: bool) -> None:
+    """Zero concept + unsupervised/residual branch params when logits-add mode is on."""
+    if not enabled:
+        return
+    with torch.no_grad():
+        if isinstance(cbl_model, CBL):
+            cbl_model.cbl.weight.zero_()
+            cbl_model.cbl.bias.zero_()
+            cbl_model.unsup.weight.zero_()
+            cbl_model.unsup.bias.zero_()
+            print("[init] --add_llama_logits enabled: zeroed CBL concept+unsup branches")
+        elif isinstance(cbl_model, CBLResidual):
+            cbl_model.cbl.weight.zero_()
+            cbl_model.cbl.bias.zero_()
+            cbl_model.cbl_residual.weight.zero_()
+            cbl_model.cbl_residual.bias.zero_()
+            print("[init] --add_llama_logits enabled: zeroed CBLResidual concept+residual branches")
+
+
 
 if __name__ == "__main__":
     # Use spawn so LCB grading workers do not fork a CUDA parent process.
@@ -769,6 +788,7 @@ if __name__ == "__main__":
         cbl = CBL(config, len(concept_set), tokenizer).to(device)
     else:
         cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
+    _zero_cbl_concept_and_unsup_branches_if_requested(cbl, args.add_llama_logits)
     opt_cbl = torch.optim.Adam(cbl.parameters(), lr=5e-5)
     print("preparing classifier")
     total_params = sum(p.numel() for p in preLM.parameters())
@@ -1204,6 +1224,7 @@ if __name__ == "__main__":
     else:
         cbl_state_path = prefix + cbl_name + "_epoch_" + str(best_epoch) + ".pt"
     cbl.load_state_dict(torch.load(cbl_state_path, map_location=device))
+    _zero_cbl_concept_and_unsup_branches_if_requested(cbl, args.add_llama_logits)
     cbl.eval()
 
     # ── Configure evaluation ──
