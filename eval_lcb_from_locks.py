@@ -1,24 +1,80 @@
+"""Orchestrate evaluation of LiveCodeBench `*_eval.lock.json` files.
+
+This script stays lightweight: it discovers lock files, filters debug runs, then
+launches `eval_lcb_single_lock.py` once per lock via `os.system`. Each worker is
+a separate Python process and writes a `*.finish.json` file before exiting; this
+script waits for that finish file before moving to the next lock.
+"""
+
 import argparse
 import glob
 import json
 import os
+import shlex
+import sys
 import time
 from pathlib import Path
 
-import wandb
 
-from eval_metrics import evaluate_saved_livecodebench_generation, safe_wandb_log
+def _is_debug_lock(lock_path: Path) -> bool:
+    """Return True if the lock corresponds to a debug training run.
 
-
-def _claim_lock(lock_path: Path) -> Path | None:
-    running_path = lock_path.with_suffix(lock_path.suffix + ".running")
+    Detection looks at both the `run_id` field inside the JSON and the
+    directory segment of the lock path (which is also `{run_id}` because
+    `eval_metrics.run_codecontests_evaluation_for_cbm` writes
+    `output/{model_label}-{steer_mode}/{run_id}/...`).
+    """
     try:
-        fd = os.open(str(running_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(f"claimed_at={time.time()}\n")
-        return running_path
-    except FileExistsError:
-        return None
+        with open(lock_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        rid = str(payload.get("run_id", "")).strip()
+    except Exception as exc:
+        print(f"Could not read {lock_path} for debug check: {exc}")
+        rid = ""
+    return rid.startswith("debug-") or "/debug-" in str(lock_path)
+
+
+def _finish_file_for_lock(lock_path: Path) -> Path:
+    return lock_path.with_suffix(lock_path.suffix + ".finish.json")
+
+
+def _build_worker_args(args) -> list[str]:
+    """Args forwarded to the separate single-lock worker script."""
+    forwarded = [
+        "--wandb_project", args.wandb_project,
+        "--lcb_num_process_evaluate", str(args.lcb_num_process_evaluate),
+        "--lcb_timeout", str(args.lcb_timeout),
+        "--lcb_recursion_limit", str(args.lcb_recursion_limit),
+    ]
+    if args.include_debug:
+        forwarded.append("--include_debug")
+    return forwarded
+
+
+def _shell_join(parts: list[str]) -> str:
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def _wait_for_finish_file_forever(finish_file: Path) -> dict:
+    """Wait indefinitely for the worker's finish JSON and return its payload."""
+    next_log_at = time.time() + 60
+    while True:
+        if finish_file.is_file():
+            with open(finish_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        now = time.time()
+        if now >= next_log_at:
+            print(f"Still waiting for finish file: {finish_file}", flush=True)
+            next_log_at = now + 60
+        time.sleep(1)
+
+
+def _system_exit_code(status: int) -> int:
+    if hasattr(os, "waitstatus_to_exitcode"):
+        return os.waitstatus_to_exitcode(status)
+    if status == 0:
+        return 0
+    return status >> 8
 
 
 def main():
@@ -70,6 +126,7 @@ def main():
     args = parser.parse_args()
     os.environ["LCB_RECURSION_LIMIT"] = str(int(args.lcb_recursion_limit))
 
+    # ── Orchestrator mode: discover, filter, then run one worker per lock ─
     lock_files = sorted(glob.glob(args.locks_glob))
     if args.max_locks > 0:
         lock_files = lock_files[: args.max_locks]
@@ -80,92 +137,66 @@ def main():
 
     print(f"Found {len(lock_files)} lock files.")
 
+    pending: list[Path] = []
     for lock_file in lock_files:
         lock_path = Path(lock_file)
-
-        if not args.include_debug:
-            # Peek at the lock without claiming it so debug runs are left untouched
-            # for any future re-run with --include_debug.
-            try:
-                with open(lock_path, "r", encoding="utf-8") as f:
-                    peek_payload = json.load(f)
-                peek_run_id = str(peek_payload.get("run_id", "")).strip()
-            except Exception as peek_err:
-                print(f"Could not read {lock_path} for debug check: {peek_err}")
-                peek_run_id = ""
-            # Debug runs never pushed to W&B, and their lock-path also contains
-            # the synthetic 'debug-<ts>' run_id segment; check both for safety.
-            if peek_run_id.startswith("debug-") or "/debug-" in str(lock_path):
-                print(f"Skipping debug lock: {lock_path}")
-                continue
-
-        running_marker = _claim_lock(lock_path)
-        if running_marker is None:
-            print(f"Skipping {lock_path} (already claimed).")
+        if not args.include_debug and _is_debug_lock(lock_path):
+            print(f"Skipping debug lock: {lock_path}")
             continue
+        pending.append(lock_path)
 
-        run = None
-        try:
-            with open(lock_path, "r", encoding="utf-8") as f:
-                lock_payload = json.load(f)
+    skipped = len(lock_files) - len(pending)
+    print(f"{len(pending)} locks to evaluate ({skipped} debug skipped).")
 
-            run_id = str(lock_payload.get("run_id", "")).strip()
-            steer_mode = str(lock_payload.get("steer_mode", "none"))
-            if run_id:
-                run = wandb.init(
-                    project=args.wandb_project,
-                    id=run_id,
-                    resume="allow",
-                )
-                print(f"Resumed W&B run: {run_id}")
-            else:
-                print(f"No run_id in {lock_path}; evaluating without W&B resume.")
+    forwarded = _build_worker_args(args)
+    worker_path = Path(__file__).with_name("eval_lcb_single_lock.py").resolve()
+    if not worker_path.is_file():
+        raise FileNotFoundError(f"Worker script not found: {worker_path}")
 
-            result = evaluate_saved_livecodebench_generation(
-                lock_payload["lcb_output_path"],
-                livecodebench_release=lock_payload["livecodebench_release"],
-                lcb_num_process_evaluate=int(args.lcb_num_process_evaluate),
-                lcb_timeout=int(args.lcb_timeout),
-                lcb_eval_path=lock_payload.get("lcb_eval_path"),
-                lcb_eval_all_path=lock_payload.get("lcb_eval_all_path"),
-            )
+    n_ok = 0
+    n_fail = 0
+    n_missing_finish = 0
+    for idx, lock_path in enumerate(pending, 1):
+        print(f"\n[{idx}/{len(pending)}] Evaluating {lock_path} ...", flush=True)
+        t0 = time.perf_counter()
+        finish_file = _finish_file_for_lock(lock_path)
+        if finish_file.exists():
+            finish_file.unlink()
+
+        cmd = _shell_join(
+            [
+                sys.executable,
+                str(worker_path),
+                "--lock_path", str(lock_path),
+                "--finish_file", str(finish_file),
+                *forwarded,
+            ]
+        )
+        print(f"Running: {cmd}", flush=True)
+        rc = _system_exit_code(os.system(cmd))
+        finish_payload = _wait_for_finish_file_forever(finish_file)
+        finish_status = str(finish_payload.get("status", "unknown"))
+
+        elapsed = time.perf_counter() - t0
+        if rc == 0:
+            n_ok += 1
             print(
-                f"[{steer_mode}] pass@1={result['pass@1']:.4f}, pass@5={result['pass@5']:.4f} "
-                f"| eval={result['lcb_eval_all_path']}"
+                f"[{idx}/{len(pending)}] {finish_status} in {elapsed:.1f}s "
+                f"(finish={finish_file})",
+                flush=True,
+            )
+        else:
+            n_fail += 1
+            print(
+                f"[{idx}/{len(pending)}] worker exited with code {rc} "
+                f"after {elapsed:.1f}s (finish_status={finish_status}, finish={finish_file})",
+                flush=True,
             )
 
-            safe_wandb_log(
-                {
-                    f"lcb/{steer_mode}/pass@1": result["pass@1"],
-                    f"lcb/{steer_mode}/pass@5": result["pass@5"],
-                    f"lcb/{steer_mode}/output_path": lock_payload["lcb_output_path"],
-                    f"lcb/{steer_mode}/eval_all_path": result["lcb_eval_all_path"],
-                    f"lcb/{steer_mode}/evaluated_from_lock": 1,
-                }
-            )
-
-            done_payload = {
-                **lock_payload,
-                "status": "completed",
-                "completed_at_unix": time.time(),
-                "pass@1": result["pass@1"],
-                "pass@5": result["pass@5"],
-                "lcb_eval_path": result["lcb_eval_path"],
-                "lcb_eval_all_path": result["lcb_eval_all_path"],
-            }
-            with open(lock_path, "w", encoding="utf-8") as f:
-                json.dump(done_payload, f, indent=2)
-
-            done_path = lock_path.with_suffix(".done.json")
-            lock_path.rename(done_path)
-            print(f"Completed {done_path}")
-        except Exception as exc:
-            print(f"Failed lock {lock_path}: {exc}")
-        finally:
-            if run is not None:
-                run.finish()
-            if running_marker.exists():
-                running_marker.unlink()
+    print(
+        f"\nOrchestrator summary: ok={n_ok} fail={n_fail} missing_finish={n_missing_finish} "
+        f"debug_skipped={skipped} total_locks={len(lock_files)}"
+    )
 
 
 if __name__ == "__main__":
