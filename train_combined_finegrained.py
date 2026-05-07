@@ -668,6 +668,7 @@ if __name__ == "__main__":
         AutoTokenizer.from_pretrained,
         LCB_LLAMA3_INSTRUCT_MODEL_ID,
         model_cache_dir,
+        use_fast=False,
     )
     tokenizer.pad_token = tokenizer.eos_token
 
