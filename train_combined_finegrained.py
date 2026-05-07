@@ -1246,7 +1246,7 @@ if __name__ == "__main__":
         keep_other_concepts=args.intervention_keep_other_concepts,
         steerability_cache_dir=steer_root,
         steerability_cache_seed=args.seed,
-        interventions_per_batch=50,
+        interventions_per_batch=max(1, int(args.lcb_prompt_batch_size)),
     )
 
     # ── Generate perplexity texts (cached) ──
