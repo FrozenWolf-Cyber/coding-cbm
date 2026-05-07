@@ -1256,6 +1256,11 @@ if __name__ == "__main__":
         llama_vocab_weight=llama_vocab_weight,
     )
 
+    # ── Perplexity computation first (fast debug fail path) ──
+    # evaluate library loads its own LLM; run this before other evals so
+    # perplexity API/environment issues surface immediately.
+    compute_perplexity(ppl_texts)
+
     # ── Concept accuracy ──
     # Pass test multi-hot labels directly (built from CF tags above).
     run_concept_accuracy_cosine(
@@ -1374,9 +1379,6 @@ if __name__ == "__main__":
             print(f"llama.cpp steerability evaluation failed (non-fatal): {llama_eval_err}")
     else:
         print("Skipping llama.cpp steerability evaluation.")
-
-    # ── Perplexity computation (evaluate library loads its own LLM) ──
-    compute_perplexity(ppl_texts)
 
     # ── RM reward scoring (optional) ──
     if not args.skip_rm:

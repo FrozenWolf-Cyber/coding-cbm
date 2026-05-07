@@ -1760,30 +1760,16 @@ def compute_perplexity(texts: list[str]) -> dict:
     """
     results = {}
 
-    c = 0
-    perplexity_metric = evaluate.load("perplexity", module_type="metric")
-    for p in texts:
-        if len(p.split()) > 30:
-            continue
-        c += 1
-        perplexity_metric.add_batch(predictions=[p])
+    short_texts = [p for p in texts if len(p.split()) <= 30]
 
-    # `evaluate` perplexity API differs by version: some versions accept an
-    # explicit `tokenizer` kwarg while others reject it. Try explicit tokenizer
-    # first (older behavior), then fall back to the newer signature.
-    ppl_tokenizer = AutoTokenizer.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID, use_fast=False)
-
-    def _compute_ppl(metric):
+    def _compute_ppl(predictions: list[str]):
         kwargs = dict(model_id=LCB_LLAMA3_INSTRUCT_MODEL_ID, max_length=100)
-        try:
-            return metric.compute(tokenizer=ppl_tokenizer, **kwargs)["mean_perplexity"]
-        except TypeError as err:
-            if "unexpected keyword argument 'tokenizer'" not in str(err):
-                raise
-            return metric.compute(**kwargs)["mean_perplexity"]
+        metric = evaluate.load("perplexity", module_type="metric")
+        metric.add_batch(predictions=predictions)
+        return metric.compute(**kwargs)["mean_perplexity"]
 
-    if c > 0:
-        ppl_short = _compute_ppl(perplexity_metric)
+    if short_texts:
+        ppl_short = _compute_ppl(short_texts)
         print(f"Perplexity (under 30 tokens): {ppl_short}")
         safe_wandb_log({"perplexity_under_30_tokens": ppl_short})
         results["perplexity_under_30_tokens"] = ppl_short
@@ -1791,15 +1777,11 @@ def compute_perplexity(texts: list[str]) -> dict:
         print("No generated texts under 30 tokens to compute perplexity.")
         safe_wandb_log({"perplexity_under_30_tokens": None})
 
-    perplexity_all = evaluate.load("perplexity", module_type="metric")
-    for p in texts:
-        perplexity_all.add_batch(predictions=[p])
-    ppl_all = _compute_ppl(perplexity_all)
+    ppl_all = _compute_ppl(texts)
     print(f"Perplexity (all tokens): {ppl_all}")
     safe_wandb_log({"perplexity_all_tokens": ppl_all})
     results["perplexity_all_tokens"] = ppl_all
 
-    del ppl_tokenizer
     return results
 
 
