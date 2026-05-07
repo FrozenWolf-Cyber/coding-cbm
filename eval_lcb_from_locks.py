@@ -59,6 +59,14 @@ def main():
         default=12000,
         help="Recursion limit used by LCB sandbox during grading.",
     )
+    parser.add_argument(
+        "--include_debug",
+        action="store_true",
+        help=(
+            "Also evaluate locks whose run_id starts with 'debug-' (produced by "
+            "train_combined_finegrained.py --debug/--debug_0_step). Off by default."
+        ),
+    )
     args = parser.parse_args()
     os.environ["LCB_RECURSION_LIMIT"] = str(int(args.lcb_recursion_limit))
 
@@ -74,6 +82,23 @@ def main():
 
     for lock_file in lock_files:
         lock_path = Path(lock_file)
+
+        if not args.include_debug:
+            # Peek at the lock without claiming it so debug runs are left untouched
+            # for any future re-run with --include_debug.
+            try:
+                with open(lock_path, "r", encoding="utf-8") as f:
+                    peek_payload = json.load(f)
+                peek_run_id = str(peek_payload.get("run_id", "")).strip()
+            except Exception as peek_err:
+                print(f"Could not read {lock_path} for debug check: {peek_err}")
+                peek_run_id = ""
+            # Debug runs never pushed to W&B, and their lock-path also contains
+            # the synthetic 'debug-<ts>' run_id segment; check both for safety.
+            if peek_run_id.startswith("debug-") or "/debug-" in str(lock_path):
+                print(f"Skipping debug lock: {lock_path}")
+                continue
+
         running_marker = _claim_lock(lock_path)
         if running_marker is None:
             print(f"Skipping {lock_path} (already claimed).")
