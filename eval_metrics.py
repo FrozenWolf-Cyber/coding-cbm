@@ -1768,18 +1768,22 @@ def compute_perplexity(texts: list[str]) -> dict:
         c += 1
         perplexity_metric.add_batch(predictions=[p])
 
-    # Work around evaluate's perplexity metric sometimes ending up with a raw
-    # tokenizers backend object (no `special_tokens_map_extended`) depending on
-    # transformers/evaluate versions. Passing an explicit Transformers tokenizer
-    # keeps the metric on the stable code path.
+    # `evaluate` perplexity API differs by version: some versions accept an
+    # explicit `tokenizer` kwarg while others reject it. Try explicit tokenizer
+    # first (older behavior), then fall back to the newer signature.
     ppl_tokenizer = AutoTokenizer.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID, use_fast=False)
 
+    def _compute_ppl(metric):
+        kwargs = dict(model_id=LCB_LLAMA3_INSTRUCT_MODEL_ID, max_length=100)
+        try:
+            return metric.compute(tokenizer=ppl_tokenizer, **kwargs)["mean_perplexity"]
+        except TypeError as err:
+            if "unexpected keyword argument 'tokenizer'" not in str(err):
+                raise
+            return metric.compute(**kwargs)["mean_perplexity"]
+
     if c > 0:
-        ppl_short = perplexity_metric.compute(
-            model_id=LCB_LLAMA3_INSTRUCT_MODEL_ID,
-            tokenizer=ppl_tokenizer,
-            max_length=100,
-        )["mean_perplexity"]
+        ppl_short = _compute_ppl(perplexity_metric)
         print(f"Perplexity (under 30 tokens): {ppl_short}")
         safe_wandb_log({"perplexity_under_30_tokens": ppl_short})
         results["perplexity_under_30_tokens"] = ppl_short
@@ -1790,11 +1794,7 @@ def compute_perplexity(texts: list[str]) -> dict:
     perplexity_all = evaluate.load("perplexity", module_type="metric")
     for p in texts:
         perplexity_all.add_batch(predictions=[p])
-    ppl_all = perplexity_all.compute(
-        model_id=LCB_LLAMA3_INSTRUCT_MODEL_ID,
-        tokenizer=ppl_tokenizer,
-        max_length=100,
-    )["mean_perplexity"]
+    ppl_all = _compute_ppl(perplexity_all)
     print(f"Perplexity (all tokens): {ppl_all}")
     safe_wandb_log({"perplexity_all_tokens": ppl_all})
     results["perplexity_all_tokens"] = ppl_all
