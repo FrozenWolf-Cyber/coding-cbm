@@ -7,7 +7,7 @@ from enum import Enum
 from datetime import datetime
 from dataclasses import dataclass
 
-from datasets import load_dataset
+from datasets import load_dataset, DownloadConfig
 
 
 class Platform(Enum):
@@ -134,7 +134,7 @@ def load_code_generation_dataset(release_version="release_v1", start_date=None, 
     try:
         dataset = load_dataset(
             "livecodebench/code_generation_lite",
-            local_files_only=True,
+            download_config=DownloadConfig(local_files_only=True),
             **base_kwargs,
         )
         print(f"[cache] LiveCodeBench local-only load succeeded (cache_dir={cache_dir})")

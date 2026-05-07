@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import numpy as np
 import evaluate
 from tqdm.auto import tqdm
-from datasets import load_dataset
+from datasets import load_dataset, DownloadConfig
 
 from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast, AutoModel, AutoModelForCausalLM
 from peft import LoraConfig, TaskType, get_peft_model
@@ -502,7 +502,11 @@ def _resolve_cache_subdir(root_dir: str, name: str) -> str:
 def _hf_load_dataset_cache_first(dataset_name: str, cache_dir: str):
     try:
         print(f"[cache] loading dataset local-only from {cache_dir}: {dataset_name}")
-        return load_dataset(dataset_name, cache_dir=cache_dir, local_files_only=True)
+        return load_dataset(
+            dataset_name,
+            cache_dir=cache_dir,
+            download_config=DownloadConfig(local_files_only=True),
+        )
     except Exception as local_err:
         print(f"[cache] local dataset miss; downloading {dataset_name}: {local_err}")
         return load_dataset(dataset_name, cache_dir=cache_dir)
