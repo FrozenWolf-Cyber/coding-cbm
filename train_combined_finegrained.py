@@ -178,7 +178,7 @@ parser.add_argument(
 parser.add_argument(
     "--num_epochs",
     type=int,
-    default=3,
+    default=5,
     help="Number of training epochs (overrides config_finegrained.epoch for code_contests).",
 )
 
