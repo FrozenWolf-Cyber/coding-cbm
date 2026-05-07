@@ -211,6 +211,15 @@ parser.add_argument(
         "disable wandb; evaluation still runs."
     ),
 )
+parser.add_argument(
+    "--debug_0_step",
+    "--DEBUG_0_STEP",
+    action="store_true",
+    help=(
+        "Debug mode variant: small train/test subset, 2 epochs but 0 train steps per epoch "
+        "(skips the optimization loop); disable wandb; evaluation still runs."
+    ),
+)
 parser.add_argument("--intervention_gen_loss", type=float, default=0.0)
 parser.add_argument("--no_detach_intervention", action='store_true', help="If set, do not detach unsup during intervention generation loss computation.")
 parser.add_argument(
@@ -537,7 +546,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     set_seed(args.seed)
-    debug_mode = args.debug
+    debug_mode = bool(args.debug or args.debug_0_step)
     hf_cache_root = str(Path(args.hf_cache_root).expanduser())
     Path(hf_cache_root).mkdir(parents=True, exist_ok=True)
     dataset_cache_dir = _resolve_cache_subdir(hf_cache_root, "datasets")
@@ -554,7 +563,10 @@ if __name__ == "__main__":
         run_name = wandb.run.id
     else:
         run_name = f"debug-{int(time.time())}"
-        print("Debug mode enabled: disabling wandb logging and limiting training to 2 epochs / 2 steps per epoch.")
+        if args.debug_0_step:
+            print("Debug mode enabled: disabling wandb logging and setting training to 2 epochs / 0 steps per epoch.")
+        else:
+            print("Debug mode enabled: disabling wandb logging and limiting training to 2 epochs / 2 steps per epoch.")
 
     def wandb_log(payload):
         if use_wandb:
@@ -796,7 +808,7 @@ if __name__ == "__main__":
     start = time.time()
     best_epoch = -1
     epochs = 2 if debug_mode else args.num_epochs * args.epoch_multiplier
-    debug_max_steps_per_epoch = 2
+    debug_max_steps_per_epoch = 0 if args.debug_0_step else 2
     for e in range(epochs):
         print("Epoch ", e+1, ":")
         preLM.train()
@@ -814,6 +826,9 @@ if __name__ == "__main__":
 
     
         for i, (batch, batch_sim) in tqdm(enumerate(train_loader), total=len(train_loader)):
+            # If requested, skip the optimization loop entirely (true 0-step debug).
+            if debug_mode and debug_max_steps_per_epoch == 0:
+                break
             batch = {k: v.to(device) for k, v in batch.items()}
             batch_sim = batch_sim.to(device)
 
