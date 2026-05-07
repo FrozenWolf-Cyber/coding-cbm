@@ -36,7 +36,6 @@ from eval_metrics import (
     load_reward_model,
     run_rm_metrics,
     run_steerability_llamacpp_judge,
-    ensure_llamacpp_dependency,
     run_codecontests_evaluation_for_cbm,
 )
 from shared_code_prompt import (
@@ -495,24 +494,8 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-args = parser.parse_args()
+    args = parser.parse_args()
 
-# Early llama.cpp dependency check (only if steer eval is requested)
-if not args.skip_llamacpp_steer_eval:
-    llm_dep_start_t = time.perf_counter()
-    from eval_metrics import ensure_llamacpp_dependency as _ensure_llamacpp_dependency  # local alias
-    if not _ensure_llamacpp_dependency():
-        print(
-            "[WARN] llama_cpp dependency unavailable after install attempt; "
-            "llama.cpp steerability evaluation will be skipped.",
-            flush=True,
-        )
-        args.skip_llamacpp_steer_eval = True
-    else:
-        print(
-            f"[eval-timing] llama.cpp dependency_check={time.perf_counter() - llm_dep_start_t:.2f}s",
-            flush=True,
-        )
     set_seed(args.seed)
     debug_mode = args.debug
 
@@ -708,7 +691,7 @@ if not args.skip_llamacpp_steer_eval:
         ).to(device)
         llama_vocab_weight = lm_head_model.get_output_embeddings().weight.detach()
         del lm_head_model
-    
+
     if args.discrimination_loss > 0:
         cbl = CBL(config, len(concept_set), tokenizer).to(device)
     else:
@@ -723,9 +706,9 @@ if not args.skip_llamacpp_steer_eval:
     print(f"Total parameters: {total_params}")
     print(f"Trainable parameters: {trainable_params} = {trainable_params/total_params:.4f} of total")
     wandb_log({"trainable_parameters": trainable_params, "trainable_ratio": trainable_params/total_params})
-    
+
     classifier = torch.nn.Linear(args.residual_dim, len(concept_set)).to(device)
-    
+
     if args.discrimination_loss > 0:
         opt_classifier = torch.optim.Adam(classifier.parameters(), lr=1e-3)
 
@@ -768,7 +751,7 @@ if not args.skip_llamacpp_steer_eval:
             "intervention_gen_loss": [],
         }
 
-        
+    
         for i, (batch, batch_sim) in tqdm(enumerate(train_loader), total=len(train_loader)):
             batch = {k: v.to(device) for k, v in batch.items()}
             batch_sim = batch_sim.to(device)
@@ -796,7 +779,7 @@ if not args.skip_llamacpp_steer_eval:
             # print("concepts shape in training loop:", concepts.shape)
             # print("elastic_net_alphaunsup shape in training loop:", unsup.shape)
             # print("vocabs shape in training loop:", vocabs.shape)
-            
+        
             mask = (batch["attention_mask"][:, :-1] != 0).reshape(-1) # (B * (seq_len - 1))
             if (not args.skip_loss_mask) and ("loss_mask" in batch):
                 # By default, supervise concept loss only on assistant tokens.
@@ -804,7 +787,7 @@ if not args.skip_llamacpp_steer_eval:
                 mask = mask & (batch["loss_mask"] > 0).reshape(-1)
             c_slice = concepts[:, :-1, :].contiguous().view(-1, concepts.shape[-1]) # (B * (seq_len - 1), C)
             batch_sim_slice = batch_sim.unsqueeze(1).expand(-1, concepts.shape[1] - 1, -1).contiguous().view(-1, batch_sim.shape[-1])
-            
+        
             valid_c = c_slice[mask]          # (N_valid, C)
             valid_sim = batch_sim_slice[mask]  # (N_valid, C)
 
@@ -822,18 +805,18 @@ if not args.skip_llamacpp_steer_eval:
             word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
             loss = args.concept_loss * concept_loss + word_loss*args.word_loss
             reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
-            
+        
             if matched_unsup is not None:
                 orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean().abs() ## TODO: check shape
                 loss += args.orthogonal_loss_weight * orthogonal_loss
                 training_losses["orthogonal_loss"].append(orthogonal_loss.detach().cpu().numpy())
-            
+        
             if args.residual_penalty_weight > 0:
                 residual_contrib = cbl.compute_residual_contrib(unsup)
                 residual_penalty = torch.mean(torch.abs(residual_contrib)) ## TODO: check logic
                 loss += args.residual_penalty_weight * residual_penalty
                 training_losses["residual_penalty_loss"].append(residual_penalty.detach().cpu().numpy())
-                
+            
             if args.intervention_gen_loss > 0:
                 ### concepts shapes: (B, seq_len, concept_dim)
                 intervention_value = get_intervention_value(DATASET)
@@ -844,7 +827,7 @@ if not args.skip_llamacpp_steer_eval:
                     intervention_value=intervention_value,
                     keep_other_concepts=args.intervention_keep_other_concepts,
                 )
-                    
+                
                 # print("intervened_concept shape: ", intervened_concept.shape, intervened_concept.max(), intervened_concept.min())
                 llama_logits_for_intervene = None
                 if llama_logits is not None:
@@ -857,11 +840,11 @@ if not args.skip_llamacpp_steer_eval:
                 intervention_gen_loss = torch.nn.CrossEntropyLoss()(vocab[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
                 loss += args.intervention_gen_loss * intervention_gen_loss
                 training_losses["intervention_gen_loss"].append(intervention_gen_loss.detach().cpu().numpy())
-                
+            
             loss += args.elastic_net_alpha * reg
-            
-            
-            
+        
+        
+        
             opt_prelm.zero_grad()
             opt_cbl.zero_grad()
             loss.backward()
@@ -897,25 +880,25 @@ if not args.skip_llamacpp_steer_eval:
 
             training_losses["concept_loss"].append(concept_loss.detach().cpu().numpy())
             training_losses["word_loss"].append(word_loss.detach().cpu().numpy())
-            
+        
             training_losses["reg_loss"].append(reg.detach().cpu().numpy())
-            
+        
             log = {}
             for key in training_losses.keys():
                 if len(training_losses[key]) > 0:
                     print(f"{key}: {training_losses[key][-1]}", end=" ")
                     log[key] = training_losses[key][-1]
             # print(" | batch ", i+1, " / ", len(train_loader), end="\r")
-            
-            
+        
+        
             log["epoch"] = e + 1
             log["batch"] = i + 1
             wandb_log(log)
-            
+        
             if debug_mode and (i + 1) >= debug_max_steps_per_epoch:
                 break
-            
-            
+        
+        
         avg_metrics = {}
         for key in training_losses.keys():
             if len(training_losses[key]) > 0:
@@ -1101,18 +1084,18 @@ if not args.skip_llamacpp_steer_eval:
 
     end = time.time()
     print("time of training CBM:", (end - start) / 3600, "hours")
-    
+
     ## delete training objects and free GPU before evaluation
     if llama_vocab_weight is not None:
         del llama_vocab_weight
         llama_vocab_weight = None
     del preLM, cbl, classifier, opt_prelm, opt_cbl
-    
+
     if args.discrimination_loss > 0:
         del opt_classifier
     gc.collect()
     torch.cuda.empty_cache()
-    
+
     ## lOAD BEST MODEL AND
     if best_epoch == -1:
         best_epoch = epochs

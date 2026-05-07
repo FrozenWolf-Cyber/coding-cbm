@@ -19,7 +19,6 @@ import importlib
 import os
 import pickle
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -113,32 +112,6 @@ CLEANED_TAGS_MAP = pickle.load(open(Path(__file__).parent / "cleaned_tags.pkl", 
 
 def _fmt_seconds(sec: float) -> str:
     return f"{float(sec):.2f}s"
-
-
-def ensure_llamacpp_dependency() -> bool:
-    """Ensure llama_cpp can be imported; install once if missing."""
-    try:
-        importlib.import_module("llama_cpp")
-        return True
-    except Exception as import_err:
-        print(f"[WARN] llama_cpp import failed: {import_err}")
-        print('Attempting install early: CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python')
-        try:
-            env = os.environ.copy()
-            env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "llama-cpp-python"],
-                env=env,
-            )
-            importlib.import_module("llama_cpp")
-            print("Successfully installed/imported llama_cpp.")
-            return True
-        except Exception as install_err:
-            print(
-                "[WARN] Failed to install/import llama_cpp after retry; "
-                f"llama.cpp evaluation will be skipped: {install_err}"
-            )
-            return False
 
 
 def get_llama_vocab_weight(device):
@@ -1471,9 +1444,11 @@ def run_steerability_llamacpp_judge(
     temperature=0.1,
 ):
     """Judge steerability by classifying generated text to closest concept with llama.cpp."""
-    if not ensure_llamacpp_dependency():
+    try:
+        Llama = importlib.import_module("llama_cpp").Llama
+    except Exception as import_err:
+        print(f"[WARN] llama_cpp not available (install llama-cpp-python): {import_err}")
         return {}
-    Llama = importlib.import_module("llama_cpp").Llama
 
     print(
         f"Loading llama.cpp judge | repo={model_repo_id} file={model_filename} "
