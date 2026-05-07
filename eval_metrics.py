@@ -836,7 +836,17 @@ def run_codecontests_evaluation_for_cbm(
         with open(lock_path, "w", encoding="utf-8") as f:
             json.dump(lock_payload, f, indent=2)
         print(f"  Wrote LCB eval lock → {lock_path}", flush=True)
+        # Important: `_flush_lcb_batch` is a closure over `all_outputs` / `all_extracted`
+        # and can keep those large lists alive unless we drop the function object too.
         del all_outputs, all_extracted, benchmark_sorted
+        del pending_lcb_prompts, pending_lcb_intervenes, pending_lcb_headings
+        del _flush_lcb_batch
+        # Loop variables can also retain the last large `problem` object / strings.
+        try:
+            del problem, prompt, intervene, text_for_steer, mapped_cf_tags, desc_flat, desc_short
+        except Exception:
+            pass
+        del lock_payload
         _eval_ck(f"LCB/{steer_mode}: generation-only mode complete")
         log_payload = {
             f"lcb/{steer_mode}/generation_only": 1,
@@ -855,12 +865,16 @@ def run_codecontests_evaluation_for_cbm(
             "output_path": str(lcb_out_path),
             "eval_lock_path": str(lock_path),
         }
+        del log_payload
 
     print(
         f"[eval-timing] all_code_evaluations_total={_fmt_seconds(time.perf_counter() - eval_start_t)}",
         flush=True,
     )
-    del benchmark
+    del benchmark, load_code_generation_dataset
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     _eval_ck("run_codecontests_evaluation_for_cbm: LCB complete; benchmark freed")
 
     return all_results
