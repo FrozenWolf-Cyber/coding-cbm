@@ -1438,6 +1438,7 @@ def run_steerability_llamacpp_judge(
     concept_set,
     model_repo_id="unsloth/Qwen3.5-27B-GGUF",
     model_filename="Qwen3.5-27B-Q8_0.gguf",
+    cache_dir=None,
     n_ctx=2048,
     max_tokens=64,
     repeat_penalty=1.15,
@@ -1454,13 +1455,21 @@ def run_steerability_llamacpp_judge(
         f"Loading llama.cpp judge | repo={model_repo_id} file={model_filename} "
         f"n_ctx={n_ctx} max_tokens={max_tokens} temp={temperature}"
     )
-    llm = Llama.from_pretrained(
-        repo_id=model_repo_id,
-        filename=model_filename,
-        n_gpu_layers=-1,
-        n_ctx=n_ctx,
-        verbose=False,
-    )
+    base_kwargs = {
+        "repo_id": model_repo_id,
+        "filename": model_filename,
+        "n_gpu_layers": -1,
+        "n_ctx": n_ctx,
+        "verbose": False,
+    }
+    if cache_dir:
+        base_kwargs["cache_dir"] = cache_dir
+    try:
+        llm = Llama.from_pretrained(local_files_only=True, **base_kwargs)
+        print(f"[cache] llama.cpp local-only load succeeded (cache_dir={cache_dir})")
+    except Exception as local_err:
+        print(f"[cache] llama.cpp local miss, downloading model: {local_err}")
+        llm = Llama.from_pretrained(**base_kwargs)
 
     total = 0
     correct = 0

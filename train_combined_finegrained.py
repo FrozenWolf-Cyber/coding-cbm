@@ -3,6 +3,7 @@ import gc
 import multiprocessing as mp
 import os
 import time
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -398,6 +399,12 @@ parser.add_argument(
     default=420,
     help="Max characters of extracted code to print per sample (with --print_extracted_code_preview).",
 )
+parser.add_argument(
+    "--hf_cache_root",
+    type=str,
+    default="./.hf_cache",
+    help="Local HuggingFace cache root used for datasets/models and llama.cpp GGUF files.",
+)
 
 
 class LazyTokenizedClassificationDataset(torch.utils.data.Dataset):
@@ -486,6 +493,35 @@ def build_loaders(raw_hf_dataset, s, mode, tokenizer, args):
     return dataloader
 
 
+def _resolve_cache_subdir(root_dir: str, name: str) -> str:
+    path = Path(root_dir).expanduser() / name
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def _hf_load_dataset_cache_first(dataset_name: str, cache_dir: str):
+    try:
+        print(f"[cache] loading dataset local-only from {cache_dir}: {dataset_name}")
+        return load_dataset(dataset_name, cache_dir=cache_dir, local_files_only=True)
+    except Exception as local_err:
+        print(f"[cache] local dataset miss; downloading {dataset_name}: {local_err}")
+        return load_dataset(dataset_name, cache_dir=cache_dir)
+
+
+def _hf_from_pretrained_cache_first(loader_fn, model_id: str, cache_dir: str, **kwargs):
+    local_kwargs = dict(kwargs)
+    local_kwargs["cache_dir"] = cache_dir
+    local_kwargs["local_files_only"] = True
+    try:
+        print(f"[cache] local-only load: {model_id} (cache_dir={cache_dir})")
+        return loader_fn(model_id, **local_kwargs)
+    except Exception as local_err:
+        print(f"[cache] local miss; downloading {model_id}: {local_err}")
+        remote_kwargs = dict(kwargs)
+        remote_kwargs["cache_dir"] = cache_dir
+        return loader_fn(model_id, **remote_kwargs)
+
+
 
 if __name__ == "__main__":
     # Use spawn so LCB grading workers do not fork a CUDA parent process.
@@ -498,6 +534,11 @@ if __name__ == "__main__":
 
     set_seed(args.seed)
     debug_mode = args.debug
+    hf_cache_root = str(Path(args.hf_cache_root).expanduser())
+    Path(hf_cache_root).mkdir(parents=True, exist_ok=True)
+    dataset_cache_dir = _resolve_cache_subdir(hf_cache_root, "datasets")
+    model_cache_dir = _resolve_cache_subdir(hf_cache_root, "models")
+    llamacpp_cache_dir = _resolve_cache_subdir(hf_cache_root, "llamacpp")
 
     use_wandb = not debug_mode
     if use_wandb:
@@ -519,8 +560,8 @@ if __name__ == "__main__":
     # code_contests data loading (deepmind/code_contests via HuggingFace)
     # ─────────────────────────────────────────────────────────────
     data_loading_start = time.time()
-    print("loading code_contests dataset from HuggingFace...")
-    raw_dataset = load_dataset("deepmind/code_contests")
+    print("loading code_contests dataset from HuggingFace cache-first...")
+    raw_dataset = _hf_load_dataset_cache_first("deepmind/code_contests", dataset_cache_dir)
     train_dataset_raw = raw_dataset["train"]
     valid_dataset_raw = raw_dataset["valid"]
     test_dataset_raw  = raw_dataset["test"]
@@ -614,8 +655,16 @@ if __name__ == "__main__":
         task_type=TaskType.FEATURE_EXTRACTION,
     )
 
-    config = LlamaConfig.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID)
-    tokenizer = AutoTokenizer.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID)
+    config = _hf_from_pretrained_cache_first(
+        LlamaConfig.from_pretrained,
+        LCB_LLAMA3_INSTRUCT_MODEL_ID,
+        model_cache_dir,
+    )
+    tokenizer = _hf_from_pretrained_cache_first(
+        AutoTokenizer.from_pretrained,
+        LCB_LLAMA3_INSTRUCT_MODEL_ID,
+        model_cache_dir,
+    )
     tokenizer.pad_token = tokenizer.eos_token
 
     tokenization_elapsed = 0.0
@@ -673,7 +722,12 @@ if __name__ == "__main__":
     )
 
     print("preparing backbone")
-    preLM = LlamaModel.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID, torch_dtype=torch.bfloat16).to(device)
+    preLM = _hf_from_pretrained_cache_first(
+        LlamaModel.from_pretrained,
+        LCB_LLAMA3_INSTRUCT_MODEL_ID,
+        model_cache_dir,
+        torch_dtype=torch.bfloat16,
+    ).to(device)
     preLM = get_peft_model(preLM, lora_config)
     del lora_config
     preLM.print_trainable_parameters()
@@ -685,8 +739,10 @@ if __name__ == "__main__":
         # IMPORTANT: For Llama-3, lm_head weights are not necessarily tied to input embeddings.
         # We therefore grab the *output* projection (lm_head) weights from a CausalLM head.
         # This does not add parameters to CBL; it's just an external tensor used in forward.
-        lm_head_model = AutoModelForCausalLM.from_pretrained(
+        lm_head_model = _hf_from_pretrained_cache_first(
+            AutoModelForCausalLM.from_pretrained,
             LCB_LLAMA3_INSTRUCT_MODEL_ID,
+            model_cache_dir,
             torch_dtype=torch.bfloat16,
         ).to(device)
         llama_vocab_weight = lm_head_model.get_output_embeddings().weight.detach()
@@ -1099,7 +1155,12 @@ if __name__ == "__main__":
     ## lOAD BEST MODEL AND
     if best_epoch == -1:
         best_epoch = epochs
-    preLM = LlamaModel.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID, torch_dtype=torch.bfloat16).to(device)
+    preLM = _hf_from_pretrained_cache_first(
+        LlamaModel.from_pretrained,
+        LCB_LLAMA3_INSTRUCT_MODEL_ID,
+        model_cache_dir,
+        torch_dtype=torch.bfloat16,
+    ).to(device)
     best_peft_path = prefix + model_name + "_best"
     if os.path.isdir(best_peft_path):
         peft_path = best_peft_path
@@ -1262,6 +1323,7 @@ if __name__ == "__main__":
                 concept_set=concept_set,
                 model_repo_id=args.llamacpp_eval_model_repo_id,
                 model_filename=args.llamacpp_eval_model_filename,
+                cache_dir=llamacpp_cache_dir,
                 n_ctx=args.llamacpp_eval_n_ctx,
                 max_tokens=args.llamacpp_eval_max_tokens,
                 repeat_penalty=args.llamacpp_eval_repeat_penalty,

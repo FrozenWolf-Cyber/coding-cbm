@@ -2,6 +2,7 @@ import json
 import zlib
 import pickle
 import base64
+import os
 from enum import Enum
 from datetime import datetime
 from dataclasses import dataclass
@@ -122,7 +123,24 @@ class CodeGenerationProblem:
 
 
 def load_code_generation_dataset(release_version="release_v1", start_date=None, end_date=None) -> list[CodeGenerationProblem]:
-    dataset = load_dataset("livecodebench/code_generation_lite", split="test", version_tag=release_version, trust_remote_code=True)
+    cache_dir = os.environ.get("HF_DATASETS_CACHE") or os.environ.get("HF_HOME")
+    base_kwargs = {
+        "split": "test",
+        "version_tag": release_version,
+        "trust_remote_code": True,
+    }
+    if cache_dir:
+        base_kwargs["cache_dir"] = cache_dir
+    try:
+        dataset = load_dataset(
+            "livecodebench/code_generation_lite",
+            local_files_only=True,
+            **base_kwargs,
+        )
+        print(f"[cache] LiveCodeBench local-only load succeeded (cache_dir={cache_dir})")
+    except Exception as local_err:
+        print(f"[cache] LiveCodeBench local miss, downloading: {local_err}")
+        dataset = load_dataset("livecodebench/code_generation_lite", **base_kwargs)
     dataset = [CodeGenerationProblem(**p) for p in dataset]  # type: ignore
     if start_date is not None:
         p_start_date = datetime.strptime(start_date, "%Y-%m-%d")
