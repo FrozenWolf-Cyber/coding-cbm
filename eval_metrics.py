@@ -1768,9 +1768,17 @@ def compute_perplexity(texts: list[str]) -> dict:
         c += 1
         perplexity_metric.add_batch(predictions=[p])
 
+    # Work around evaluate's perplexity metric sometimes ending up with a raw
+    # tokenizers backend object (no `special_tokens_map_extended`) depending on
+    # transformers/evaluate versions. Passing an explicit Transformers tokenizer
+    # keeps the metric on the stable code path.
+    ppl_tokenizer = AutoTokenizer.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID, use_fast=False)
+
     if c > 0:
         ppl_short = perplexity_metric.compute(
-            model_id=LCB_LLAMA3_INSTRUCT_MODEL_ID, max_length=100,
+            model_id=LCB_LLAMA3_INSTRUCT_MODEL_ID,
+            tokenizer=ppl_tokenizer,
+            max_length=100,
         )["mean_perplexity"]
         print(f"Perplexity (under 30 tokens): {ppl_short}")
         safe_wandb_log({"perplexity_under_30_tokens": ppl_short})
@@ -1783,12 +1791,15 @@ def compute_perplexity(texts: list[str]) -> dict:
     for p in texts:
         perplexity_all.add_batch(predictions=[p])
     ppl_all = perplexity_all.compute(
-        model_id=LCB_LLAMA3_INSTRUCT_MODEL_ID, max_length=100,
+        model_id=LCB_LLAMA3_INSTRUCT_MODEL_ID,
+        tokenizer=ppl_tokenizer,
+        max_length=100,
     )["mean_perplexity"]
     print(f"Perplexity (all tokens): {ppl_all}")
     safe_wandb_log({"perplexity_all_tokens": ppl_all})
     results["perplexity_all_tokens"] = ppl_all
 
+    del ppl_tokenizer
     return results
 
 
