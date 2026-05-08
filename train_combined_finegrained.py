@@ -1317,33 +1317,33 @@ if __name__ == "__main__":
 
         # ── (2) LiveCodeBench benchmark ───────────────────────────────────────
 
-        # print("[pre-code-eval] Running LiveCodeBench benchmark generation + eval locks ...", flush=True)
-        # run_livecodebench_benchmark_generation_for_cbm(
-        #     preLM=preLM,
-        #     cbl=cbl,
-        #     tokenizer=tokenizer,
-        #     concept_set=concept_set,
-        #     seed=args.seed,
-        #     batch_size=args.lcb_prompt_batch_size,
-        #     model_label=f"CBM-Llama3-{DATASET}",
-        #     layer_idx=best_epoch,
-        #     run_id=run_name,
-        #     llama_vocab_weight=llama_vocab_weight,
-        #     display=not debug_mode,
-        #     # Steering
-        #     steer_modes=lcb_steer_modes,
-        #     steer_value=steer_value,
-        #     keep_other_concepts=args.intervention_keep_other_concepts,
-        #     # LiveCodeBench generation
-        #     livecodebench_release=args.livecodebench_release,
-        #     lcb_n_samples=args.lcb_n_samples,
-        #     lcb_temperature=args.lcb_temperature,
-        #     lcb_top_p=args.lcb_top_p,
-        #     lcb_max_new_tokens=args.lcb_max_new_tokens,
-        #     print_extracted_code_preview=args.print_extracted_code_preview,
-        #     extracted_preview_chars=args.extracted_preview_chars,
-        #     eval_log_host_memory=eval_log_host_memory,
-        # )
+        print("[pre-code-eval] Running LiveCodeBench benchmark generation + eval locks ...", flush=True)
+        run_livecodebench_benchmark_generation_for_cbm(
+            preLM=preLM,
+            cbl=cbl,
+            tokenizer=tokenizer,
+            concept_set=concept_set,
+            seed=args.seed,
+            batch_size=args.lcb_prompt_batch_size,
+            model_label=f"CBM-Llama3-{DATASET}",
+            layer_idx=best_epoch,
+            run_id=run_name,
+            llama_vocab_weight=llama_vocab_weight,
+            display=not debug_mode,
+            # Steering
+            steer_modes=lcb_steer_modes,
+            steer_value=steer_value,
+            keep_other_concepts=args.intervention_keep_other_concepts,
+            # LiveCodeBench generation
+            livecodebench_release=args.livecodebench_release,
+            lcb_n_samples=args.lcb_n_samples,
+            lcb_temperature=args.lcb_temperature,
+            lcb_top_p=args.lcb_top_p,
+            lcb_max_new_tokens=args.lcb_max_new_tokens,
+            print_extracted_code_preview=args.print_extracted_code_preview,
+            extracted_preview_chars=args.extracted_preview_chars,
+            eval_log_host_memory=eval_log_host_memory,
+        )
     except Exception as code_eval_err:
         import traceback
         print(f"Code generation evaluation failed (non-fatal):\n{traceback.format_exc()}")
