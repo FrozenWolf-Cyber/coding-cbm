@@ -32,30 +32,20 @@ import torch.nn.functional as F
 import wandb
 from tqdm.auto import tqdm
 from transformers import (
-    AutoModel,
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoTokenizer,
-    LlamaConfig,
     LlamaModel,
-    RobertaTokenizerFast,
 )
 
-from modules import CBL, CBLResidual, Roberta_classifier
+from modules import CBL, CBLResidual
 from shared_code_prompt import (
     LCB_LLAMA3_INSTRUCT_MODEL_ID,
     format_lcb_llama3_instruct_prompt,
 )
-from steerability_cache import (
-    load_concept_samples,
-    save_all_steerability_texts,
-    steerability_output_root,
-    write_samples_batch,
-)
 from utils import (
     cos_sim_cubed,
     eos_pooling,
-    mean_pooling,
     compute_multilabel_topk_accuracy,
     compute_multilabel_concept_metrics,
 )
@@ -377,9 +367,8 @@ def _memory_checkpoint(msg: str, *, log_host_ram: bool = False) -> None:
         torch.cuda.empty_cache()
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
-
-def run_codecontests_evaluation_for_cbm(
+# ── Split entry points (code_contests test set vs LiveCodeBench benchmark) ──
+def run_codecontests_testset_evaluation_for_cbm(
     preLM,
     cbl,
     tokenizer,
@@ -401,49 +390,28 @@ def run_codecontests_evaluation_for_cbm(
     llama_vocab_weight=None,
     display: bool = True,
     # ── Steering ──────────────────────────────────────────────────────────────
-    # Pass a list to run multiple modes in one call, each logged separately.
-    # Valid values: "none" (unsteered baseline), "groundtruth" (CF-tag steering).
     steer_modes: Optional[List[str]] = None,
     steer_value: Optional[float] = None,
     keep_other_concepts: bool = False,
-    # ── LiveCodeBench ─────────────────────────────────────────────────────────
-    livecodebench_release: str = "release_v6",
-    # LCB generation uses n=10, temp=0.2 to match the leaderboard exactly.
-    lcb_n_samples: int = 10,
-    lcb_temperature: float = 0.2,
-    lcb_top_p: float = 0.95,
-    lcb_top_k: int = 50,
-    lcb_max_new_tokens: int = 2000,
-    lcb_repetition_penalty: float = 1.05,
-    livecodebench_split: str = "test",
+    # Preview/debug controls
     print_extracted_code_preview: bool = False,
     extracted_preview_chars: int = 420,
     # If set to a one-element list [ds], use ds for code_contests then set holder[0]=None
-    # so the HF test split can be freed before LiveCodeBench loads (avoids duplicate refs).
+    # so the HF test split can be freed before LiveCodeBench loads.
     test_dataset_holder: Optional[List[Any]] = None,
     # When True, append process RSS + system used/available to every [eval-mem] line.
     eval_log_host_memory: bool = False,
 ) -> dict:
-    """Generate code for code_contests and LiveCodeBench and save artifacts.
-
-    Runs each steer_mode independently and logs generation artifacts to wandb.
-
-    Steering modes
-    --------------
-    "none"       : plain CBM forward pass — the apples-to-apples baseline vs LLaMA-3-8B.
-    "groundtruth": use CF tags from the dataset to select concept(s) to steer.
-
-    LiveCodeBench generation outputs are saved to
-    output/{model_label}-{steer_mode}/codegeneration_{n}_{temp}.json
-    and an accompanying *_eval.lock.json file consumed by eval_lcb_from_locks.py.
-    """
+    """Run only code_contests internal test-set generation + concept-tag metrics."""
     import json
-    from pathlib import Path
 
     preLM.eval()
     cbl.eval()
     set_seed(seed)
     eval_start_t = time.perf_counter()
+
+    if run_id is None:
+        run_id = wandb.run.id if wandb.run is not None else "norun"
 
     if steer_value is None:
         steer_value = float(get_intervention_value("code_contests"))
@@ -451,14 +419,7 @@ def run_codecontests_evaluation_for_cbm(
     if steer_modes is None:
         steer_modes = ["none"]
 
-    lcb_repo = Path(__file__).parent / "LiveCodeBench"
-
-    if run_id is None:
-        run_id = wandb.run.id if wandb.run is not None else "norun"
-
-    device = next(preLM.parameters()).device
     base_root = Path(results_root) if results_root else Path(__file__).parent / "results"
-
     all_results: dict = {}
 
     def _eval_ck(msg: str) -> None:
@@ -478,129 +439,132 @@ def run_codecontests_evaluation_for_cbm(
     else:
         _cc_td = test_dataset
 
-    _eval_ck("run_codecontests_evaluation_for_cbm: start (before code_contests)")
+    _eval_ck("run_codecontests_testset_evaluation_for_cbm: start (before code_contests test set)")
 
-    # ═════════════════════════════════════════════════════════════════════════
-    # 1. code_contests internal test set  (1 sample per problem, pass@1)
-    # ═════════════════════════════════════════════════════════════════════════
-    if _cc_td is not None:
-        print(f"\n{'='*60}")
-        print(f" code_contests test set  ({len(_cc_td)} problems)")
-        print(f"{'='*60}")
-        concept_index = {c: idx for idx, c in enumerate(concept_set)}
+    if _cc_td is None:
+        return {}
 
-        for steer_mode in steer_modes:
-            mode_label = f"{model_label}-{steer_mode}"
-            cc_dir = base_root / "code_contests" / mode_label
-            cc_dir.mkdir(parents=True, exist_ok=True)
-            out_path = cc_dir / f"l{layer_idx}-seed{seed}-{run_id}.jsonl"
-            cc_total_prompts = sum(1 for idx in range(len(_cc_td)) if str(_cc_td[idx].get("description", "")).strip())
+    print(f"\n{'='*60}")
+    print(f" code_contests test set  ({len(_cc_td)} problems)")
+    print(f"{'='*60}")
+    concept_index = {c: idx for idx, c in enumerate(concept_set)}
 
-            print(f"\n[{steer_mode}] Generating solutions for code_contests test set ...", flush=True)
-            cc_generation_start_t = time.perf_counter()
-            rows = []
-            concept_pred_rows = []
-            concept_target_rows = []
-            prompt_batch_size = max(1, int(batch_size))
-            pending_prompts: List[str] = []
-            pending_intervenes: List[Optional[List[float]]] = []
-            pending_meta_rows: List[dict] = []
+    for steer_mode in steer_modes:
+        mode_label = f"{model_label}-{steer_mode}"
+        cc_dir = base_root / "code_contests" / mode_label
+        cc_dir.mkdir(parents=True, exist_ok=True)
+        out_path = cc_dir / f"l{layer_idx}-seed{seed}-{run_id}.jsonl"
+        cc_total_prompts = sum(1 for idx in range(len(_cc_td)) if str(_cc_td[idx].get("description", "")).strip())
 
-            def _flush_cc_batch():
-                if not pending_prompts:
-                    return
-                flush_batch_size = len(pending_prompts)
-                flush_start_t = time.perf_counter()
-                generated = _generate_solutions_batched(
-                    preLM,
-                    cbl,
-                    tokenizer,
-                    pending_prompts,
-                    device,
-                    n_samples=1,
-                    intervenes=pending_intervenes,
-                    keep_other_concepts=keep_other_concepts,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    repetition_penalty=repetition_penalty,
-                    llama_vocab_weight=llama_vocab_weight,
+        print(f"\n[{steer_mode}] Generating solutions for code_contests test set ...", flush=True)
+        cc_generation_start_t = time.perf_counter()
+        rows = []
+        concept_pred_rows = []
+        concept_target_rows = []
+        prompt_batch_size = max(1, int(batch_size))
+        pending_prompts: List[str] = []
+        pending_intervenes: List[Optional[List[float]]] = []
+        pending_meta_rows: List[dict] = []
+
+        def _flush_cc_batch():
+            if not pending_prompts:
+                return
+            flush_batch_size = len(pending_prompts)
+            flush_start_t = time.perf_counter()
+            generated = _generate_solutions_batched(
+                preLM,
+                cbl,
+                tokenizer,
+                pending_prompts,
+                device,
+                n_samples=1,
+                intervenes=pending_intervenes,
+                keep_other_concepts=keep_other_concepts,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                llama_vocab_weight=llama_vocab_weight,
+            )
+            for meta, outputs_for_prompt in zip(pending_meta_rows, generated):
+                solution = outputs_for_prompt[0]
+                extracted = _extract_code_from_output(solution)
+                rows.append(
+                    {
+                        **meta,
+                        "raw_output": solution,
+                        "extracted_code": extracted,
+                    }
                 )
-                for meta, outputs_for_prompt in zip(pending_meta_rows, generated):
-                    solution = outputs_for_prompt[0]
-                    extracted = _extract_code_from_output(solution)
-                    rows.append(
-                        {
-                            **meta,
-                            "raw_output": solution,
-                            "extracted_code": extracted,
-                        }
+                if print_extracted_code_preview:
+                    desc = meta.get("description_preview") or ""
+                    pname = meta.get("problem_name", "")
+                    print_extracted_code_samples_preview(
+                        f"[{steer_mode}] code_contests  problem={pname!r}  "
+                        f"description (start): {desc!r}",
+                        [extracted],
+                        preview_chars=extracted_preview_chars,
                     )
-                    if print_extracted_code_preview:
-                        desc = meta.get("description_preview") or ""
-                        pname = meta.get("problem_name", "")
-                        print_extracted_code_samples_preview(
-                            f"[{steer_mode}] code_contests  problem={pname!r}  "
-                            f"description (start): {desc!r}",
-                            [extracted],
-                            preview_chars=extracted_preview_chars,
-                        )
-                pending_prompts.clear()
-                pending_intervenes.clear()
-                pending_meta_rows.clear()
-                flush_elapsed = time.perf_counter() - flush_start_t
-                cc_done = len(rows)
-                cc_left = max(0, cc_total_prompts - cc_done)
-                print(
-                    f"[eval-timing] code_contests/{steer_mode}: flush_generation="
-                    f"{_fmt_seconds(flush_elapsed)} | batch={flush_batch_size} | done={cc_done}/{cc_total_prompts} | left={cc_left}",
-                    flush=True,
+            pending_prompts.clear()
+            pending_intervenes.clear()
+            pending_meta_rows.clear()
+            flush_elapsed = time.perf_counter() - flush_start_t
+            cc_done = len(rows)
+            cc_left = max(0, cc_total_prompts - cc_done)
+            print(
+                f"[eval-timing] code_contests/{steer_mode}: flush_generation="
+                f"{_fmt_seconds(flush_elapsed)} | batch={flush_batch_size} | done={cc_done}/{cc_total_prompts} | left={cc_left}",
+                flush=True,
+            )
+            del generated
+
+        device = next(preLM.parameters()).device
+
+        for i in tqdm(range(len(_cc_td)), desc=f"cc/{steer_mode}", disable=not display):
+            problem = _cc_td[i]
+            description = problem["description"].strip()
+            if not description:
+                continue
+
+            cf_tags = problem["cf_tags"]
+            intervene = _resolve_intervene(
+                steer_mode,
+                description,
+                cf_tags,
+                preLM,
+                cbl,
+                tokenizer,
+                device,
+                concept_set,
+                steer_value,
+            )
+            prompt = _format_code_generation_prompt(tokenizer, description, language="python")
+            eval_enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
+            with torch.no_grad():
+                eval_features = preLM(
+                    input_ids=eval_enc["input_ids"],
+                    attention_mask=eval_enc["attention_mask"],
+                ).last_hidden_state
+                eval_llama_logits = (
+                    F.linear(eval_features, llama_vocab_weight) if llama_vocab_weight is not None else None
                 )
-                del generated
+                eval_concepts, _, _, _ = cbl(eval_features.float(), llama_logits=eval_llama_logits)
+                pooled_eval_concepts = eos_pooling(eval_concepts, eval_enc["attention_mask"]).squeeze(0).detach().cpu()
 
-            for i in tqdm(range(len(_cc_td)), desc=f"cc/{steer_mode}", disable=not display):
-                problem = _cc_td[i]
-                description = problem["description"].strip()
-                if not description:
-                    continue
+            target_multihot = torch.zeros(len(concept_set), dtype=torch.float32)
+            for tag in cf_tags:
+                idx = concept_index.get(tag)
+                if idx is not None:
+                    target_multihot[idx] = 1.0
+            if bool((target_multihot > 0).any()):
+                concept_pred_rows.append(pooled_eval_concepts)
+                concept_target_rows.append(target_multihot)
 
-                cf_tags = problem["cf_tags"]
-                intervene = _resolve_intervene(
-                    steer_mode, description, cf_tags, preLM, cbl, tokenizer,
-                    device, concept_set, steer_value,
-                )
-                prompt = _format_code_generation_prompt(
-                    tokenizer,
-                    description,
-                    language="python",
-                )
-                eval_enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
-                with torch.no_grad():
-                    eval_features = preLM(
-                        input_ids=eval_enc["input_ids"],
-                        attention_mask=eval_enc["attention_mask"],
-                    ).last_hidden_state
-                    eval_llama_logits = (
-                        F.linear(eval_features, llama_vocab_weight)
-                        if llama_vocab_weight is not None
-                        else None
-                    )
-                    eval_concepts, _, _, _ = cbl(eval_features.float(), llama_logits=eval_llama_logits)
-                    pooled_eval_concepts = eos_pooling(eval_concepts, eval_enc["attention_mask"]).squeeze(0).detach().cpu()
-
-                target_multihot = torch.zeros(len(concept_set), dtype=torch.float32)
-                for tag in cf_tags:
-                    idx = concept_index.get(tag)
-                    if idx is not None:
-                        target_multihot[idx] = 1.0
-                if bool((target_multihot > 0).any()):
-                    concept_pred_rows.append(pooled_eval_concepts)
-                    concept_target_rows.append(target_multihot)
-
-                pending_prompts.append(prompt)
-                pending_intervenes.append(intervene)
-                pending_meta_rows.append({
+            pending_prompts.append(prompt)
+            pending_intervenes.append(intervene)
+            pending_meta_rows.append(
+                {
                     "problem_name": problem.get("name", f"problem_{i}"),
                     "description_preview": description[:300],
                     "cf_tags": cf_tags,
@@ -611,117 +575,184 @@ def run_codecontests_evaluation_for_cbm(
                     "layer_idx": layer_idx,
                     "seed": seed,
                     "run_id": run_id,
-                })
-                if len(pending_prompts) >= prompt_batch_size:
-                    _flush_cc_batch()
-            _flush_cc_batch()
-            cc_generation_elapsed = time.perf_counter() - cc_generation_start_t
-
-            with open(out_path, "w", encoding="utf-8") as f:
-                for row in rows:
-                    f.write(json.dumps(row) + "\n")
-            print(f"  Saved {len(rows)} solutions → {out_path}", flush=True)
-            print(
-                f"[eval-timing] code_contests/{steer_mode}: generation={_fmt_seconds(cc_generation_elapsed)}",
-                flush=True,
-            )
-            _eval_mem_line(
-                f"code_contests/{steer_mode}: jsonl written; computing concept-tag metrics ...",
-            )
-
-            cc_testing_start_t = time.perf_counter()
-            concept_acc_metrics = {}
-            if concept_pred_rows:
-                pred_tensor = torch.stack(concept_pred_rows, dim=0)
-                target_tensor = torch.stack(concept_target_rows, dim=0)
-                topk_metrics = compute_multilabel_concept_metrics(
-                    prediction_scores=pred_tensor,
-                    target_scores=target_tensor,
-                    topk=(1, 5, 10),
-                )
-                concept_acc_metrics = {
-                    f"cc/{steer_mode}/concept_tag_top1_acc": topk_metrics["top1_acc"],
-                    f"cc/{steer_mode}/concept_tag_top5_acc": topk_metrics["top5_acc"],
-                    f"cc/{steer_mode}/concept_tag_top10_acc": topk_metrics["top10_acc"],
-                    f"cc/{steer_mode}/concept_tag_top1_iou": topk_metrics["top1_iou"],
-                    f"cc/{steer_mode}/concept_tag_top5_iou": topk_metrics["top5_iou"],
-                    f"cc/{steer_mode}/concept_tag_top10_iou": topk_metrics["top10_iou"],
-                    f"cc/{steer_mode}/concept_tag_cosine_raw": topk_metrics["cosine_raw"],
-                    f"cc/{steer_mode}/concept_tag_cosine_cubed": topk_metrics["cosine_cubed"],
                 }
-                print(
-                    "  Concept-tag metrics: "
-                    f"top1={topk_metrics['top1_acc']:.4f}, "
-                    f"top5={topk_metrics['top5_acc']:.4f}, "
-                    f"top10={topk_metrics['top10_acc']:.4f}, "
-                    f"iou@1={topk_metrics['top1_iou']:.4f}, "
-                    f"iou@5={topk_metrics['top5_iou']:.4f}, "
-                    f"iou@10={topk_metrics['top10_iou']:.4f}, "
-                    f"cos={topk_metrics['cosine_raw']:.4f}, "
-                    f"cos_cubed={topk_metrics['cosine_cubed']:.4f}"
-                )
-                del pred_tensor, target_tensor
-            cc_testing_elapsed = time.perf_counter() - cc_testing_start_t
+            )
+            if len(pending_prompts) >= prompt_batch_size:
+                _flush_cc_batch()
+
+        _flush_cc_batch()
+        cc_generation_elapsed = time.perf_counter() - cc_generation_start_t
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+
+        print(f"  Saved {len(rows)} solutions → {out_path}", flush=True)
+        print(f"[eval-timing] code_contests/{steer_mode}: generation={_fmt_seconds(cc_generation_elapsed)}", flush=True)
+        _eval_mem_line(f"code_contests/{steer_mode}: jsonl written; computing concept-tag metrics ...")
+
+        cc_testing_start_t = time.perf_counter()
+        concept_acc_metrics = {}
+        if concept_pred_rows:
+            pred_tensor = torch.stack(concept_pred_rows, dim=0)
+            target_tensor = torch.stack(concept_target_rows, dim=0)
+            topk_metrics = compute_multilabel_concept_metrics(
+                prediction_scores=pred_tensor,
+                target_scores=target_tensor,
+                topk=(1, 5, 10),
+            )
+            concept_acc_metrics = {
+                f"cc/{steer_mode}/concept_tag_top1_acc": topk_metrics["top1_acc"],
+                f"cc/{steer_mode}/concept_tag_top5_acc": topk_metrics["top5_acc"],
+                f"cc/{steer_mode}/concept_tag_top10_acc": topk_metrics["top10_acc"],
+                f"cc/{steer_mode}/concept_tag_top1_iou": topk_metrics["top1_iou"],
+                f"cc/{steer_mode}/concept_tag_top5_iou": topk_metrics["top5_iou"],
+                f"cc/{steer_mode}/concept_tag_top10_iou": topk_metrics["top10_iou"],
+                f"cc/{steer_mode}/concept_tag_cosine_raw": topk_metrics["cosine_raw"],
+                f"cc/{steer_mode}/concept_tag_cosine_cubed": topk_metrics["cosine_cubed"],
+            }
             print(
-                f"[eval-timing] code_contests/{steer_mode}: testing={_fmt_seconds(cc_testing_elapsed)}",
-                flush=True,
+                "  Concept-tag metrics: "
+                f"top1={topk_metrics['top1_acc']:.4f}, "
+                f"top5={topk_metrics['top5_acc']:.4f}, "
+                f"top10={topk_metrics['top10_acc']:.4f}, "
+                f"iou@1={topk_metrics['top1_iou']:.4f}, "
+                f"iou@5={topk_metrics['top5_iou']:.4f}, "
+                f"iou@10={topk_metrics['top10_iou']:.4f}, "
+                f"cos={topk_metrics['cosine_raw']:.4f}, "
+                f"cos_cubed={topk_metrics['cosine_cubed']:.4f}",
             )
 
-            log_payload = {
-                f"cc/{steer_mode}/solutions_written": len(rows),
-                f"cc/{steer_mode}/output_path": str(out_path),
-            }
-            log_payload.update(concept_acc_metrics)
-            if wandb.run is not None:
-                safe_wandb_log(log_payload)
-            all_results[f"cc/{steer_mode}"] = {"output_path": str(out_path), **concept_acc_metrics}
-            del rows, concept_pred_rows, concept_target_rows
+        cc_testing_elapsed = time.perf_counter() - cc_testing_start_t
+        print(f"[eval-timing] code_contests/{steer_mode}: testing={_fmt_seconds(cc_testing_elapsed)}", flush=True)
 
-        del concept_index
-        _cc_td = None
-        if test_dataset_holder is not None:
-            test_dataset_holder[0] = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        _eval_ck("code_contests: all steer_modes done (concept_index dropped, test split refs cleared if holder used)")
+        log_payload = {
+            f"cc/{steer_mode}/solutions_written": len(rows),
+            f"cc/{steer_mode}/output_path": str(out_path),
+        }
+        log_payload.update(concept_acc_metrics)
+        if wandb.run is not None:
+            safe_wandb_log(log_payload)
 
-    # ═════════════════════════════════════════════════════════════════════════
-    # 2. LiveCodeBench  (n_samples per problem, full pass@k grading)
-    # ═════════════════════════════════════════════════════════════════════════
+        # Per-mode generations payload kept in memory so the caller can run downstream
+        # evals (perplexity, llama.cpp judge, RM) AFTER preLM/cbl are freed from GPU.
+        generations_payload = {
+            "output_path": str(out_path),
+            "raw_outputs": [r["raw_output"] for r in rows],
+            "extracted_codes": [r["extracted_code"] for r in rows],
+            "cf_tags_per_problem": [list(r["cf_tags"]) for r in rows],
+            "problem_names": [r["problem_name"] for r in rows],
+            "concept_metrics": concept_acc_metrics,
+        }
+        all_results[f"cc/{steer_mode}"] = {
+            "output_path": str(out_path),
+            **concept_acc_metrics,
+            "generations": generations_payload,
+        }
+        del rows, concept_pred_rows, concept_target_rows
 
-    print(f"\n{'='*60}", flush=True)
-    print(f" LiveCodeBench  (release={livecodebench_release}, n={lcb_n_samples}, T={lcb_temperature})", flush=True)
-    print(f"{'='*60}", flush=True)
-    _eval_ck("LiveCodeBench: before _import_lcb / HF dataset load")
+    print(f"[eval-timing] code_contests_all_total={_fmt_seconds(time.perf_counter() - eval_start_t)}", flush=True)
+    del concept_index
+    _eval_ck("run_codecontests_testset_evaluation_for_cbm: done (concept_index dropped)")
 
-    load_code_generation_dataset, _, _ = _import_lcb()
-    _eval_ck("LiveCodeBench: _import_lcb done; calling load_code_generation_dataset ...")
+    if test_dataset_holder is not None:
+        test_dataset_holder[0] = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return all_results
+
+
+def run_livecodebench_benchmark_generation_for_cbm(
+    preLM,
+    cbl,
+    tokenizer,
+    concept_set: List[str],
+    seed: int = 42,
+    batch_size: int = 4,
+    model_label: str = "CBM-Llama3-code_contests",
+    layer_idx: int = -1,
+    run_id=None,
+    results_root=None,  # kept for API symmetry; not used for LCB outputs
+    llama_vocab_weight=None,
+    display: bool = True,
+    # ── Steering ──────────────────────────────────────────────────────────────
+    steer_modes: Optional[List[str]] = None,
+    steer_value: Optional[float] = None,
+    keep_other_concepts: bool = False,
+    # ── LiveCodeBench ─────────────────────────────────────────────────────────
+    livecodebench_release: str = "release_v6",
+    lcb_n_samples: int = 10,
+    lcb_temperature: float = 0.2,
+    lcb_top_p: float = 0.95,
+    lcb_top_k: int = 50,
+    lcb_max_new_tokens: int = 2000,
+    lcb_repetition_penalty: float = 1.05,
+    lcb_max_retries: int = 0,  # unused placeholder; kept to avoid breaking older experiments
+    lcb_prompt_batch_size: Optional[int] = None,  # unused; caller controls prompt batch size via batch_size
+    print_extracted_code_preview: bool = False,
+    extracted_preview_chars: int = 420,
+    eval_log_host_memory: bool = False,
+) -> dict:
+    """Run only LiveCodeBench benchmark generation + write eval lock JSON."""
+    import json
+
+    preLM.eval()
+    cbl.eval()
+    set_seed(seed)
+    eval_start_t = time.perf_counter()
+
+    if run_id is None:
+        run_id = wandb.run.id if wandb.run is not None else "norun"
+
+    if steer_value is None:
+        steer_value = float(get_intervention_value("code_contests"))
+    if steer_modes is None:
+        steer_modes = ["none"]
+
+    lcb_repo = Path(__file__).parent / "LiveCodeBench"
+    all_results: dict = {}
+
+    def _eval_ck(msg: str) -> None:
+        _memory_checkpoint(msg, log_host_ram=eval_log_host_memory)
+
+    def _eval_mem_line(msg: str) -> None:
+        extra = ""
+        if eval_log_host_memory:
+            hm = _format_host_memory_stats()
+            if hm:
+                extra = f"  |  {hm}"
+        print(f"[eval-mem] {msg}{extra}", flush=True)
+
+    _eval_ck("run_livecodebench_benchmark_generation_for_cbm: before _import_lcb")
+    load_code_generation_dataset, codegen_metrics, extract_instance_results = _import_lcb()
+    _eval_ck("run_livecodebench_benchmark_generation_for_cbm: _import_lcb done; calling load_code_generation_dataset")
 
     lcb_dataset_start_t = time.perf_counter()
     benchmark = load_code_generation_dataset(livecodebench_release)
     lcb_dataset_elapsed = time.perf_counter() - lcb_dataset_start_t
     print(f"  Loaded {len(benchmark)} LCB problems", flush=True)
-    print(
-        f"[eval-timing] livecodebench: dataset_loading={_fmt_seconds(lcb_dataset_elapsed)}",
-        flush=True,
-    )
-    _eval_ck("LiveCodeBench: benchmark loaded")
+    print(f"[eval-timing] livecodebench: dataset_loading={_fmt_seconds(lcb_dataset_elapsed)}", flush=True)
+    _eval_ck("run_livecodebench_benchmark_generation_for_cbm: benchmark loaded")
+
+    device = next(preLM.parameters()).device
+
     for steer_mode in steer_modes:
-        # LCB canonical output path mirrors what main.py would produce.
-        # model_repr = "{model_label}-{steer_mode}"  → leaderboard row label
         mode_repr = f"{model_label}-{steer_mode}"
         lcb_out_dir = Path(lcb_repo) / "output" / mode_repr / str(run_id)
         lcb_out_dir.mkdir(parents=True, exist_ok=True)
         lcb_out_path = lcb_out_dir / f"codegeneration_{lcb_n_samples}_{lcb_temperature}.json"
         lcb_eval_path = lcb_out_dir / f"codegeneration_{lcb_n_samples}_{lcb_temperature}_eval.json"
         lcb_eval_all_path = lcb_out_dir / f"codegeneration_{lcb_n_samples}_{lcb_temperature}_eval_all.json"
-        # ── Generation ──
+
         print(f"\n[{steer_mode}] Generating {lcb_n_samples} solutions × {len(benchmark)} LCB problems ...")
         lcb_generation_start_t = time.perf_counter()
+
         all_outputs: List[List[str]] = []
         all_extracted: List[List[str]] = []
         benchmark_sorted = sorted(benchmark, key=lambda x: x.question_id)
+
         lcb_total_prompts = len(benchmark_sorted)
         prompt_batch_size = max(1, int(batch_size))
         pending_lcb_prompts: List[str] = []
@@ -773,18 +804,24 @@ def run_codecontests_evaluation_for_cbm(
             del generated
 
         for problem in tqdm(benchmark_sorted, desc=f"lcb/{steer_mode}", disable=not display):
-            text_for_steer = problem.question_content  # problem statement text
+            text_for_steer = problem.question_content
             problem_id = str(problem.question_id)
             mapped_cf_tags = CLEANED_TAGS_MAP.get(problem_id, {}).get("tags", [])
             if problem_id not in CLEANED_TAGS_MAP and steer_mode == "groundtruth":
                 print(
-                    f"[warn] Missing CLEANED_TAGS_MAP entry for LCB question_id={problem_id}; "
-                    "using empty tags (no steering for this sample).",
+                    f"[warn] Missing CLEANED_TAGS_MAP entry for LCB question_id={problem_id}; using empty tags (no steering for this sample).",
                     flush=True,
                 )
             intervene = _resolve_intervene(
-                steer_mode, text_for_steer, mapped_cf_tags, preLM, cbl, tokenizer,
-                device, concept_set, steer_value,
+                steer_mode,
+                text_for_steer,
+                mapped_cf_tags,
+                preLM,
+                cbl,
+                tokenizer,
+                device,
+                concept_set,
+                steer_value,
             )
             prompt = _format_code_generation_prompt(
                 tokenizer,
@@ -802,17 +839,15 @@ def run_codecontests_evaluation_for_cbm(
             )
             if len(pending_lcb_prompts) >= prompt_batch_size:
                 _flush_lcb_batch()
+
         _flush_lcb_batch()
         lcb_generation_elapsed = time.perf_counter() - lcb_generation_start_t
         _eval_mem_line(
             f"LCB steer_mode={steer_mode!r}: generation loop finished ({len(all_outputs)} prompt batches)"
         )
-        print(
-            f"[eval-timing] livecodebench/{steer_mode}: generation={_fmt_seconds(lcb_generation_elapsed)}",
-            flush=True,
-        )
+        print(f"[eval-timing] livecodebench/{steer_mode}: generation={_fmt_seconds(lcb_generation_elapsed)}", flush=True)
         _eval_ck(f"LCB/{steer_mode}: before building save_results JSON")
-        # Save in LCB canonical JSON format
+
         save_results = [
             problem.insert_output(outputs, codes)
             for problem, outputs, codes in zip(benchmark_sorted, all_outputs, all_extracted)
@@ -820,7 +855,7 @@ def run_codecontests_evaluation_for_cbm(
         with open(lcb_out_path, "w") as f:
             json.dump(save_results, f, indent=4)
         print(f"  Saved LCB outputs → {lcb_out_path}", flush=True)
-        del save_results
+
         lock_path = lcb_out_path.with_name(lcb_out_path.name.replace(".json", "_eval.lock.json"))
         lock_payload = {
             "status": "pending_eval",
@@ -836,18 +871,8 @@ def run_codecontests_evaluation_for_cbm(
         with open(lock_path, "w", encoding="utf-8") as f:
             json.dump(lock_payload, f, indent=2)
         print(f"  Wrote LCB eval lock → {lock_path}", flush=True)
-        # Important: `_flush_lcb_batch` is a closure over `all_outputs` / `all_extracted`
-        # and can keep those large lists alive unless we drop the function object too.
-        del all_outputs, all_extracted, benchmark_sorted
-        del pending_lcb_prompts, pending_lcb_intervenes, pending_lcb_headings
-        del _flush_lcb_batch
-        # Loop variables can also retain the last large `problem` object / strings.
-        try:
-            del problem, prompt, intervene, text_for_steer, mapped_cf_tags, desc_flat, desc_short
-        except Exception:
-            pass
-        del lock_payload
-        _eval_ck(f"LCB/{steer_mode}: generation-only mode complete")
+
+        # Generation-only mode: only write outputs + locks. Actual grading happens in eval_lcb_from_locks.py.
         log_payload = {
             f"lcb/{steer_mode}/generation_only": 1,
             f"lcb/{steer_mode}/n_samples": lcb_n_samples,
@@ -865,19 +890,31 @@ def run_codecontests_evaluation_for_cbm(
             "output_path": str(lcb_out_path),
             "eval_lock_path": str(lock_path),
         }
-        del log_payload
+
+        # Release large lists before next steer_mode.
+        del save_results
+        del all_outputs, all_extracted, benchmark_sorted
+        del pending_lcb_prompts, pending_lcb_intervenes, pending_lcb_headings
+        try:
+            del _flush_lcb_batch
+        except Exception:
+            pass
 
     print(
         f"[eval-timing] all_code_evaluations_total={_fmt_seconds(time.perf_counter() - eval_start_t)}",
         flush=True,
     )
-    del benchmark, load_code_generation_dataset
+
+    del benchmark, load_code_generation_dataset, codegen_metrics, extract_instance_results
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    _eval_ck("run_codecontests_evaluation_for_cbm: LCB complete; benchmark freed")
+    _eval_ck("run_livecodebench_benchmark_generation_for_cbm: done")
 
     return all_results
+
+
+
 
 
 def evaluate_saved_livecodebench_generation(
@@ -1071,333 +1108,7 @@ def load_model_and_cbl(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Steerability Text Generation (with disk caching)
-# ═══════════════════════════════════════════════════════════════
-
-def generate_steerability_texts(
-    preLM,
-    cbl,
-    tokenizer,
-    concept_set,
-    dataset,
-    device,
-    samples_per_concept,
-    print_k=3,
-    llama_vocab_weight=None,
-    keep_other_concepts=False,
-    steerability_cache_dir=None,
-    steerability_cache_seed=42,
-    interventions_per_batch=1,
-):
-    """
-    Generate steered texts for each concept with caching.
-
-    Returns list-of-lists: ``decoded_texts_by_concept[concept_idx][sample_idx]``.
-    """
-    intervention_value = get_intervention_value(dataset)
-    input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-    special_tokens_mask = torch.tensor([128000, 128001]).to(device)
-    num_concepts = len(concept_set)
-    chunk_size = 25
-    cseed = steerability_cache_seed
-
-    all_slots: list[list[str | None]] = []
-    for concept_idx in range(num_concepts):
-        cname = concept_set[concept_idx]
-        slots = load_concept_samples(
-            steerability_cache_dir, cseed, concept_idx, cname, samples_per_concept,
-        )
-        all_slots.append(slots)
-
-    with torch.no_grad():
-        if interventions_per_batch <= 1:
-            for concept_idx in tqdm(range(num_concepts), desc="Steerability generation"):
-                v = [0] * num_concepts
-                v[concept_idx] = intervention_value
-                cname = concept_set[concept_idx]
-                slots = all_slots[concept_idx]
-                pos = 0
-                while pos < samples_per_concept:
-                    if slots[pos] is not None:
-                        pos += 1
-                        continue
-                    end = pos
-                    while end < samples_per_concept and slots[end] is None:
-                        end += 1
-                    gen_pos = pos
-                    while gen_pos < end:
-                        current_batch = min(chunk_size, end - gen_pos)
-                        text_ids_batch, _ = cbl.generate_batch(
-                            input_ids, preLM,
-                            num_samples=current_batch,
-                            intervene=v, length=50,
-                            keep_other_concepts=keep_other_concepts,
-                            llama_vocab_weight=llama_vocab_weight,
-                        )
-                        pending_writes: list[tuple] = []
-                        for b in range(current_batch):
-                            sample_idx = gen_pos + b
-                            decoded = tokenizer.decode(
-                                text_ids_batch[b][~torch.isin(text_ids_batch[b], special_tokens_mask)]
-                            )
-                            slots[sample_idx] = decoded
-                            if steerability_cache_dir:
-                                pending_writes.append(
-                                    (concept_idx, cname, cseed, sample_idx, decoded)
-                                )
-                        if pending_writes:
-                            write_samples_batch(steerability_cache_dir, pending_writes)
-                        gen_pos += current_batch
-                    pos = end
-        else:
-            for group_start in tqdm(
-                range(0, num_concepts, interventions_per_batch),
-                desc=f"Steerability generation (x{interventions_per_batch} concepts/batch)",
-            ):
-                group_end = min(group_start + interventions_per_batch, num_concepts)
-                group_indices = list(range(group_start, group_end))
-
-                needs_gen: list[int] = []
-                missing_indices: dict[int, list[int]] = {}
-                for ci in group_indices:
-                    missing = [i for i in range(samples_per_concept) if all_slots[ci][i] is None]
-                    if missing:
-                        needs_gen.append(ci)
-                        missing_indices[ci] = missing
-
-                if not needs_gen:
-                    continue
-
-                interventions = []
-                for ci in needs_gen:
-                    v = [0] * num_concepts
-                    v[ci] = intervention_value
-                    interventions.append(v)
-
-                max_missing = max(len(missing_indices[ci]) for ci in needs_gen)
-                gen_offset = 0
-                while gen_offset < max_missing:
-                    current_chunk = min(chunk_size, max_missing - gen_offset)
-                    text_ids_batch, _ = cbl.generate_multi_concept_batch(
-                        input_ids, preLM,
-                        interventions=interventions,
-                        samples_per_intervention=current_chunk,
-                        length=50,
-                        keep_other_concepts=keep_other_concepts,
-                        llama_vocab_weight=llama_vocab_weight,
-                    )
-                    pending_writes = []
-                    for g, ci in enumerate(needs_gen):
-                        row_start = g * current_chunk
-                        mi = missing_indices[ci]
-                        cname = concept_set[ci]
-                        for b in range(current_chunk):
-                            abs_idx = gen_offset + b
-                            if abs_idx >= len(mi):
-                                continue
-                            sample_idx = mi[abs_idx]
-                            decoded = tokenizer.decode(
-                                text_ids_batch[row_start + b][
-                                    ~torch.isin(text_ids_batch[row_start + b], special_tokens_mask)
-                                ]
-                            )
-                            all_slots[ci][sample_idx] = decoded
-                            if steerability_cache_dir:
-                                pending_writes.append(
-                                    (ci, cname, cseed, sample_idx, decoded)
-                                )
-                    if pending_writes:
-                        write_samples_batch(steerability_cache_dir, pending_writes)
-                    gen_offset += current_chunk
-
-    should_log_samples_to_wandb = wandb.run is not None
-
-    all_texts: list[list[str]] = []
-    for concept_idx in range(num_concepts):
-        cname = concept_set[concept_idx]
-        concept_texts = [all_slots[concept_idx][k] for k in range(samples_per_concept)]
-        if should_log_samples_to_wandb:
-            for idx, t in enumerate(concept_texts):
-                safe_wandb_log({f"steerability_sample_{cname}_{idx + 1}": t})
-        if print_k > 0:
-            print(f"Concept '{cname}' sample preview:")
-            for k in range(min(print_k, len(concept_texts))):
-                print(f"  [{k+1}] {concept_texts[k]}")
-        all_texts.append(concept_texts)
-
-    return all_texts
-
-
-# ═══════════════════════════════════════════════════════════════
-# Steerability Evaluation: RoBERTa Classifiers
-# ═══════════════════════════════════════════════════════════════
-
-def score_steerability_roberta(
-    decoded_texts_by_concept, roberta_tokenizer, classifier, concept_set, device,
-):
-    """Score steerability texts with a single RoBERTa classifier. Returns accuracy dict."""
-    pred, ref = [], []
-    acc = evaluate.load("accuracy")
-    with torch.no_grad():
-        for concept_idx, concept_texts in enumerate(
-            tqdm(decoded_texts_by_concept, desc="Steerability scoring")
-        ):
-            if not concept_texts:
-                continue
-            roberta_enc = roberta_tokenizer(
-                concept_texts, return_tensors="pt", truncation=True,
-                max_length=512, padding=True,
-            ).to(device)
-            roberta_input = {
-                "input_ids": roberta_enc["input_ids"],
-                "attention_mask": roberta_enc["attention_mask"],
-            }
-            logits = classifier(roberta_input)
-            pred.extend(torch.argmax(logits, dim=-1).detach().cpu().tolist())
-            ref.extend([concept_idx] * len(concept_texts))
-    acc.add_batch(predictions=np.array(pred), references=np.array(ref))
-    return acc.compute()
-
-
-# Backward-compatible alias used by resume_steerability_test
-run_steerability_test_from_texts = score_steerability_roberta
-
-
-def run_steerability_roberta(
-    decoded_texts_by_concept,
-    concept_set,
-    dataset,
-    device,
-    classifier_weight_suffixes=("_seed42", "_seed123", "_seed456"),
-):
-    """Run steerability eval with multiple RoBERTa classifiers. Returns dict of accuracies."""
-    roberta_tokenizer = RobertaTokenizerFast.from_pretrained("roberta-base")
-    d_name = dataset.replace("/", "_")
-    classifier_paths = [f"{d_name}_classifier.pt"]
-    for suffix in classifier_weight_suffixes:
-        classifier_paths.append(f"{d_name}_classifier{suffix}.pt")
-
-    results = {}
-    for clf_idx, classifier_path in enumerate(classifier_paths):
-        if not os.path.exists(classifier_path):
-            print(f"Warning: Classifier not found at {classifier_path}, skipping...")
-            continue
-        print(f"Testing steerability with classifier: {classifier_path}")
-        classifier = Roberta_classifier(len(concept_set)).to(device)
-        classifier.load_state_dict(torch.load(classifier_path, map_location=device))
-        classifier.eval()
-        try:
-            classifier = torch.compile(classifier)
-        except Exception:
-            pass
-
-        acc = score_steerability_roberta(
-            decoded_texts_by_concept, roberta_tokenizer, classifier, concept_set, device,
-        )
-        log_key = "steerability_test_accuracy" if clf_idx == 0 else f"steerability_test_accuracy_{clf_idx}"
-        print(f"  {log_key}: {acc}")
-        safe_wandb_log({log_key: acc})
-        results[log_key] = acc
-
-        del classifier
-        torch.cuda.empty_cache()
-
-    return results
-
-
-# ═══════════════════════════════════════════════════════════════
-# Steerability Evaluation: MPNet Similarity
-# ═══════════════════════════════════════════════════════════════
-
-def run_steerability_mpnet(
-    decoded_texts_by_concept, concept_set, intervention_value, max_length, device,
-):
-    """Run steerability eval using MPNet sentence similarity. Returns dict of metrics."""
-    tokenizer_sim = AutoTokenizer.from_pretrained("sentence-transformers/all-mpnet-base-v2")
-    sim_model = AutoModel.from_pretrained("sentence-transformers/all-mpnet-base-v2").to(device)
-    sim_model.eval()
-
-    encoded_c = tokenizer_sim(concept_set, padding=True, truncation=True, max_length=max_length)
-    encoded_c = {k: torch.tensor(v).to(device) for k, v in encoded_c.items()}
-    concept_features = sim_model(
-        input_ids=encoded_c["input_ids"], attention_mask=encoded_c["attention_mask"],
-    )
-    concept_features = mean_pooling(concept_features.last_hidden_state, encoded_c["attention_mask"])
-    concept_features = F.normalize(concept_features, p=2, dim=1)
-
-    cos_sim_cubed_values: list[float] = []
-    softmax_values: list[float] = []
-    top1_correct = top3_correct = top5_correct = top10_correct = top20_correct = 0
-    total_evals = 0
-    ce_loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
-
-    with torch.no_grad():
-        for j in tqdm(range(len(concept_set)), desc="Steerability MPNet scoring"):
-            decoded_texts = decoded_texts_by_concept[j]
-            if not decoded_texts:
-                continue
-
-            v = [0] * len(concept_set)
-            v[j] = intervention_value
-
-            generated_c = tokenizer_sim(
-                decoded_texts, padding=True, truncation=True,
-                max_length=max_length, return_tensors="pt",
-            )
-            generated_c = {k: v_t.to(device) for k, v_t in generated_c.items()}
-            generated_features = sim_model(
-                input_ids=generated_c["input_ids"],
-                attention_mask=generated_c["attention_mask"],
-            )
-            generated_features = mean_pooling(
-                generated_features.last_hidden_state, generated_c["attention_mask"],
-            )
-            generated_features = F.normalize(generated_features, p=2, dim=1)
-
-            sims = generated_features @ concept_features.T
-            v_tensor = torch.tensor(v).to(device).unsqueeze(0).expand(sims.size(0), -1)
-
-            cos_vals = cos_sim_cubed(sims, v_tensor.float(), reduce=False)
-            cos_sim_cubed_values.extend(cos_vals.detach().cpu().tolist())
-
-            targets = torch.full((sims.size(0),), j, dtype=torch.long, device=device)
-            ce_vals = ce_loss_fn(sims, targets)
-            softmax_values.extend(ce_vals.detach().cpu().tolist())
-
-            sorted_indices = torch.argsort(sims, dim=1, descending=True)
-            top1_correct += (sorted_indices[:, 0] == j).sum().item()
-            top3_correct += (sorted_indices[:, :3] == j).any(dim=1).sum().item()
-            top5_correct += (sorted_indices[:, :5] == j).any(dim=1).sum().item()
-            top10_correct += (sorted_indices[:, :10] == j).any(dim=1).sum().item()
-            top20_correct += (sorted_indices[:, :20] == j).any(dim=1).sum().item()
-            total_evals += sims.size(0)
-
-    del sim_model
-    torch.cuda.empty_cache()
-
-    metrics = {
-        "steerability_cos_sim_cubed": (
-            sum(cos_sim_cubed_values) / len(cos_sim_cubed_values)
-            if cos_sim_cubed_values else float("nan")
-        ),
-        "steerability_softmax": (
-            sum(softmax_values) / len(softmax_values)
-            if softmax_values else float("nan")
-        ),
-        "steerability_top1_acc": top1_correct / total_evals if total_evals else 0.0,
-        "steerability_top3_acc": top3_correct / total_evals if total_evals else 0.0,
-        "steerability_top5_acc": top5_correct / total_evals if total_evals else 0.0,
-        "steerability_top10_acc": top10_correct / total_evals if total_evals else 0.0,
-        "steerability_top20_acc": top20_correct / total_evals if total_evals else 0.0,
-    }
-    safe_wandb_log(metrics)
-    for k, v in metrics.items():
-        print(f"  {k}: {v}")
-    return metrics
-
-
-# ═══════════════════════════════════════════════════════════════
-# Steerability Evaluation: llama.cpp Judge (annotate_llamacpp style)
+# Per-solution llama.cpp Judge (multi-label vs ground-truth cf_tags)
 # ═══════════════════════════════════════════════════════════════
 
 def _llamacpp_build_raw_prompt(text: str, concepts: list[str]) -> str:
@@ -1405,19 +1116,22 @@ def _llamacpp_build_raw_prompt(text: str, concepts: list[str]) -> str:
     im_end = "<|im_end|>"
     nl = "\n"
     system_text = (
-        "You are a strict classifier for coding tasks. "
-        "Given generated code or a coding solution, output ONLY a single line containing exactly one algorithm "
-        "or concept name copied verbatim from OPTIONS. "
+        "You are a strict multi-label classifier for coding tasks. "
+        "Given generated code or a coding solution, output ONLY a single line containing a comma-separated "
+        "list of algorithm or concept names copied verbatim from OPTIONS. "
+        "If no option applies, output exactly the word: none. "
         "No explanation, no preamble, no bullets."
     )
     assistant_prefill = "<think>\n\n</think>\n\n"
     opts_block = "\n".join(f"- {c}" for c in concepts)
     user_text = (
-        "From OPTIONS, pick the single algorithm or programming concept that best matches the approach, "
-        "technique, or topic reflected in GENERATED_TEXT (code, pseudocode, or solution text).\n\n"
+        "From OPTIONS, list ALL algorithm or programming concept labels that apply to the approach, "
+        "technique, or topic reflected in GENERATED_TEXT (code, pseudocode, or solution text). "
+        "Return a comma-separated list using labels copied verbatim from OPTIONS. "
+        "If nothing applies, return exactly: none.\n\n"
         f"OPTIONS:\n{opts_block}\n\n"
         f"GENERATED_TEXT:\n{text}\n\n"
-        "Answer (one label verbatim from OPTIONS, nothing else):"
+        "Answer (comma-separated subset of OPTIONS, or 'none', nothing else):"
     )
     return (
         f"{im_start}system{nl}{system_text}{im_end}{nl}"
@@ -1426,39 +1140,97 @@ def _llamacpp_build_raw_prompt(text: str, concepts: list[str]) -> str:
     )
 
 
-def _llamacpp_parse_output(output: str, concepts: list[str]) -> str:
+def _llamacpp_parse_output(output: str, concepts: list[str]) -> list[str]:
+    """Return the subset of `concepts` predicted by the judge, in order of first occurrence.
+
+    The judge is prompted to return a comma-separated list of labels copied verbatim from
+    OPTIONS, or the word ``none``. We accept some sloppiness: case-insensitive matching and
+    fuzzy substring fallback, mirroring the previous single-label behaviour but applied to
+    every comma/semicolon-separated piece. Empty input or ``none`` yields an empty list.
+    """
     first_line = next((ln.strip() for ln in str(output).splitlines() if ln.strip()), "")
-    if not first_line:
-        return concepts[0]
+    if not first_line or first_line.strip().lower() == "none":
+        return []
 
     parts = [p.strip() for p in re.split(r"[,;]", first_line) if p.strip()]
     if not parts:
         parts = [first_line]
 
+    seen: set[str] = set()
+    matched: list[str] = []
+
+    def _add(label: str) -> None:
+        if label not in seen:
+            seen.add(label)
+            matched.append(label)
+
     for p in parts:
+        if p.lower() == "none":
+            continue
         if p in concepts:
-            return p
-        m = next((c for c in concepts if c.lower() == p.lower()), None)
-        if m is not None:
-            return m
-        for c in concepts:
-            if p.lower() in c.lower() or c.lower() in p.lower():
-                return c
-    return concepts[0]
+            _add(p)
+            continue
+        exact_ci = next((c for c in concepts if c.lower() == p.lower()), None)
+        if exact_ci is not None:
+            _add(exact_ci)
+            continue
+        fuzzy = next(
+            (c for c in concepts if p.lower() in c.lower() or c.lower() in p.lower()),
+            None,
+        )
+        if fuzzy is not None:
+            _add(fuzzy)
+    return matched
 
 
-def run_steerability_llamacpp_judge(
-    decoded_texts_by_concept,
-    concept_set,
-    model_repo_id="unsloth/Qwen3.5-27B-GGUF",
-    model_filename="Qwen3.5-27B-Q8_0.gguf",
-    cache_dir=None,
-    n_ctx=2048,
-    max_tokens=64,
-    repeat_penalty=1.15,
-    temperature=0.1,
-):
-    """Judge steerability by classifying generated text to closest concept with llama.cpp."""
+def _multi_label_set_metrics(pred: Sequence[str], gold: Sequence[str]) -> Dict[str, float]:
+    """Per-problem precision / recall / F1 / IoU on label sets."""
+    pred_set = {p for p in pred if p}
+    gold_set = {g for g in gold if g}
+    if not gold_set and not pred_set:
+        return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "iou": 1.0}
+    if not gold_set:
+        return {"precision": 0.0, "recall": 1.0, "f1": 0.0, "iou": 0.0}
+    if not pred_set:
+        return {"precision": 1.0, "recall": 0.0, "f1": 0.0, "iou": 0.0}
+    inter = len(pred_set & gold_set)
+    union = len(pred_set | gold_set)
+    precision = inter / len(pred_set)
+    recall = inter / len(gold_set)
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    iou = inter / union if union > 0 else 0.0
+    return {"precision": precision, "recall": recall, "f1": f1, "iou": iou}
+
+
+def run_llamacpp_judge_per_solution(
+    generations_by_mode: Dict[str, dict],
+    concept_set: List[str],
+    *,
+    model_repo_id: str = "unsloth/Qwen3.5-27B-GGUF",
+    model_filename: str = "Qwen3.5-27B-Q8_0.gguf",
+    cache_dir: Optional[str] = None,
+    n_ctx: int = 2048,
+    max_tokens: int = 128,
+    repeat_penalty: float = 1.15,
+    temperature: float = 0.1,
+    use_extracted_code: bool = True,
+    audit_jsonl_root: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Multi-label llama.cpp judge over per-solution generations from code_contests.
+
+    Each ``generations_by_mode[steer_mode]`` payload comes from
+    :func:`run_codecontests_testset_evaluation_for_cbm` and provides parallel lists of
+    ``raw_outputs`` / ``extracted_codes`` / ``cf_tags_per_problem`` / ``problem_names``.
+    For every problem we ask the judge to list ALL applicable concepts and score the
+    prediction set against ``cf_tags`` with precision / recall / F1 / IoU.
+
+    Loading / unloading the GGUF model uses the same pattern as the previous
+    steerability judge: prefer local cache, fall back to download, ``del`` and ``gc``
+    once done. The actual ``llm(prompt, ...)`` call is unchanged.
+    """
+    if not generations_by_mode:
+        return {}
+
     try:
         Llama = importlib.import_module("llama_cpp").Llama
     except Exception as import_err:
@@ -1485,59 +1257,116 @@ def run_steerability_llamacpp_judge(
         print(f"[cache] llama.cpp local miss, downloading model: {local_err}")
         llm = Llama.from_pretrained(**base_kwargs)
 
-    total = 0
-    correct = 0
-    raw_outputs = []
+    results_by_mode: Dict[str, Any] = {}
+    try:
+        for steer_mode, payload in generations_by_mode.items():
+            if not payload:
+                continue
+            raw_outputs = payload.get("raw_outputs") or []
+            extracted_codes = payload.get("extracted_codes") or []
+            cf_tags_per_problem = payload.get("cf_tags_per_problem") or []
+            problem_names = payload.get("problem_names") or [
+                f"problem_{i}" for i in range(len(raw_outputs))
+            ]
+            n = len(raw_outputs)
+            if n == 0:
+                continue
 
-    for target_idx, texts in enumerate(tqdm(decoded_texts_by_concept, desc="Steerability llama.cpp judging")):
-        for sample_idx, text in enumerate(texts):
-            prompt = _llamacpp_build_raw_prompt(text, concept_set)
-            try:
-                out = llm(
-                    prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=0.9,
-                    top_k=40,
-                    repeat_penalty=repeat_penalty,
-                    stop=["<|im_end|>", "<|im_start|>", "\n\n"],
+            judge_rows: List[Dict[str, Any]] = []
+            agg_p, agg_r, agg_f1, agg_iou = [], [], [], []
+
+            for i in tqdm(
+                range(n),
+                desc=f"llama.cpp judge cc/{steer_mode}",
+            ):
+                if use_extracted_code and i < len(extracted_codes) and extracted_codes[i]:
+                    text = extracted_codes[i]
+                else:
+                    text = raw_outputs[i] if i < len(raw_outputs) else ""
+                gold = list(cf_tags_per_problem[i]) if i < len(cf_tags_per_problem) else []
+
+                prompt = _llamacpp_build_raw_prompt(text, concept_set)
+                try:
+                    out = llm(
+                        prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=0.9,
+                        top_k=40,
+                        repeat_penalty=repeat_penalty,
+                        stop=["<|im_end|>", "<|im_start|>", "\n\n"],
+                    )
+                    raw = out["choices"][0]["text"] if out and out.get("choices") else ""
+                except Exception as e:
+                    print(
+                        f"[WARN] llama.cpp judge failed at cc/{steer_mode} idx={i} "
+                        f"problem={problem_names[i] if i < len(problem_names) else '?'}: {e}"
+                    )
+                    raw = ""
+
+                pred_labels = _llamacpp_parse_output(raw, concept_set)
+                row_metrics = _multi_label_set_metrics(pred_labels, gold)
+                agg_p.append(row_metrics["precision"])
+                agg_r.append(row_metrics["recall"])
+                agg_f1.append(row_metrics["f1"])
+                agg_iou.append(row_metrics["iou"])
+
+                judge_rows.append(
+                    {
+                        "steer_mode": steer_mode,
+                        "problem_idx": i,
+                        "problem_name": problem_names[i] if i < len(problem_names) else f"problem_{i}",
+                        "gold_cf_tags": gold,
+                        "pred_labels": pred_labels,
+                        "raw_output": raw,
+                        **row_metrics,
+                    }
                 )
-                raw = out["choices"][0]["text"] if out and out.get("choices") else ""
-            except Exception as e:
-                print(f"[WARN] llama.cpp judge failed at concept={target_idx} sample={sample_idx}: {e}")
-                raw = ""
 
-            pred_label = _llamacpp_parse_output(raw, concept_set)
-            pred_idx = concept_set.index(pred_label) if pred_label in concept_set else 0
-            is_correct = int(pred_idx == target_idx)
-            correct += is_correct
-            total += 1
-
-            raw_outputs.append(
-                {
-                    "target_idx": int(target_idx),
-                    "target_label": concept_set[target_idx],
-                    "sample_idx": int(sample_idx),
-                    "pred_label": pred_label,
-                    "raw_output": raw,
-                }
+            mode_metrics = {
+                f"cc/{steer_mode}/llamacpp_judge_precision": float(np.mean(agg_p)),
+                f"cc/{steer_mode}/llamacpp_judge_recall": float(np.mean(agg_r)),
+                f"cc/{steer_mode}/llamacpp_judge_f1": float(np.mean(agg_f1)),
+                f"cc/{steer_mode}/llamacpp_judge_iou": float(np.mean(agg_iou)),
+                f"cc/{steer_mode}/llamacpp_judge_total": int(len(agg_p)),
+            }
+            print(
+                f"  cc/{steer_mode}: llamacpp_judge "
+                f"precision={mode_metrics[f'cc/{steer_mode}/llamacpp_judge_precision']:.4f} "
+                f"recall={mode_metrics[f'cc/{steer_mode}/llamacpp_judge_recall']:.4f} "
+                f"f1={mode_metrics[f'cc/{steer_mode}/llamacpp_judge_f1']:.4f} "
+                f"iou={mode_metrics[f'cc/{steer_mode}/llamacpp_judge_iou']:.4f} "
+                f"(n={mode_metrics[f'cc/{steer_mode}/llamacpp_judge_total']})"
             )
-            safe_wandb_log(
-                {
-                    f"steerability_llamacpp_pred_{target_idx}_{sample_idx}": pred_label,
-                    f"steerability_llamacpp_correct_{target_idx}_{sample_idx}": is_correct,
-                }
-            )
+            safe_wandb_log(mode_metrics)
 
-    acc = (correct / total) if total > 0 else 0.0
-    metrics = {
-        "steerability_llamacpp_judge_accuracy": float(acc),
-        "steerability_llamacpp_judge_total": int(total),
-    }
-    print(f"  steerability_llamacpp_judge_accuracy: {acc:.4f} ({correct}/{total})")
-    safe_wandb_log(metrics)
+            audit_path: Optional[str] = None
+            output_path = payload.get("output_path")
+            if output_path:
+                p = Path(output_path)
+                audit_path = str(p.with_name(p.stem + ".judge.jsonl"))
+            elif audit_jsonl_root:
+                Path(audit_jsonl_root).mkdir(parents=True, exist_ok=True)
+                audit_path = str(Path(audit_jsonl_root) / f"{steer_mode}.judge.jsonl")
+            if audit_path:
+                with open(audit_path, "w", encoding="utf-8") as f:
+                    for row in judge_rows:
+                        f.write(json.dumps(row) + "\n")
+                print(f"  Saved judge audit → {audit_path}")
 
-    return {"metrics": metrics, "raw_outputs": raw_outputs}
+            results_by_mode[steer_mode] = {
+                "metrics": mode_metrics,
+                "audit_path": audit_path,
+                "rows": judge_rows,
+            }
+    finally:
+        try:
+            del llm
+        except NameError:
+            pass
+        gc.collect()
+
+    return results_by_mode
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1700,57 +1529,8 @@ def run_weight_analysis(cbl, concept_set, tokenizer):
 
 
 # ═══════════════════════════════════════════════════════════════
-# Perplexity (split: generate texts, then compute metric)
+# Perplexity (computed from pre-generated texts; no generator helper).
 # ═══════════════════════════════════════════════════════════════
-
-def _perplexity_cache_path(cache_dir, seed):
-    return os.path.join(cache_dir, f"perplexity_texts_seed{seed}.pkl")
-
-
-def generate_perplexity_texts(
-    cbl, preLM, tokenizer, seed, device,
-    n_samples=100, cache_dir=None, run_name=None,
-    llama_vocab_weight=None,
-):
-    """Generate free (un-intervened) texts for perplexity. Supports caching."""
-    set_seed(seed)
-    pred: list[str] = []
-    cached = False
-
-    if cache_dir:
-        cache_path = _perplexity_cache_path(cache_dir, seed)
-        if os.path.exists(cache_path):
-            with open(cache_path, "rb") as f:
-                pred = pickle.load(f)
-            if len(pred) >= n_samples:
-                pred = pred[:n_samples]
-                cached = True
-                print(f"Loaded {len(pred)} cached perplexity texts from {cache_path}")
-
-    if not cached:
-        input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-        for _ in tqdm(range(n_samples), desc="Generating perplexity texts"):
-            with torch.no_grad():
-                text_ids, _ = cbl.generate(input_ids, preLM, llama_vocab_weight=llama_vocab_weight)
-                pred.append(tokenizer.decode(text_ids[0], skip_special_tokens=True))
-
-        if cache_dir:
-            os.makedirs(cache_dir, exist_ok=True)
-            with open(_perplexity_cache_path(cache_dir, seed), "wb") as f:
-                pickle.dump(pred, f)
-            print(f"Saved perplexity texts to cache")
-
-    if run_name:
-        os.makedirs("perplexity_text", exist_ok=True)
-        with open(f"perplexity_text/{run_name}_generated_texts_{seed}.pkl", "wb") as f:
-            pickle.dump(pred, f)
-
-    print("Some generated texts:")
-    for i in range(min(5, len(pred))):
-        print(pred[i])
-
-    return pred
-
 
 def compute_perplexity(texts: list[str]) -> dict:
     """Compute perplexity (under-30 tokens and all tokens) from pre-generated texts.
@@ -1835,11 +1615,25 @@ def compute_perplexity(texts: list[str]) -> dict:
 # RM (Reward Model) Metrics
 # ═══════════════════════════════════════════════════════════════
 
-RM_USER_RELEVANCE = "Write a text about the concept: {concept_name}"
-RM_USER_GRAMMAR = "Write a grammatically correct and fluent paragraph."
-RM_USER_TOGETHER = "Write a grammatically correct and fluent text about the concept: {concept_name}"
+RM_USER_RELEVANCE_MULTI = (
+    "Write code that reflects the algorithm(s) or concept(s) named: {concepts}. "
+    "It may also reflect other concepts."
+)
+RM_USER_GRAMMAR = (
+    "Write code that is syntactically valid (must parse/compile). "
+    "It does not need to be optimal or efficient."
+)
+RM_USER_TOGETHER_MULTI = (
+    "Write code that reflects the algorithm(s) or concept(s) named: {concepts} "
+    "and is syntactically valid. It may also reflect other concepts."
+)
 RM_LOGIT_CLIP_MIN = -100.0
 RM_LOGIT_CLIP_MAX = 100.0
+
+
+def _format_concepts_for_rm(concepts: Sequence[str]) -> str:
+    """Comma-join cf_tags for the RM user-turn templates."""
+    return ", ".join(str(c).strip() for c in concepts if str(c).strip())
 
 
 def load_reward_model(rm_model_name: str, rm_device: torch.device):
@@ -1897,88 +1691,172 @@ def _raw_logits_for_texts(
     return all_scores
 
 
-def run_rm_metrics(
-    decoded_texts_by_concept,
-    concept_set,
+def _rm_score_grouped(
     rm_model,
     rm_tokenizer,
     rm_device,
-    rm_batch_size=0,
-    rm_max_text_len=500,
-):
-    """Score steerability texts with RM (relevance, grammar, together).
+    rm_batch_size: int,
+    rm_max_text_len: int,
+    texts: Sequence[str],
+    user_turns: Sequence[str],
+) -> List[float]:
+    """Score (text, user_turn) pairs by grouping rows with identical user_turn into batches.
 
-    Returns dict with global means/stds and per-concept breakdown.
+    The actual RM forward (``_raw_logits_for_texts``) is unchanged — we just minimize
+    duplicate template formatting work and amortize the batch axis across rows that
+    share the same user prompt (e.g. RM_USER_GRAMMAR is constant across all rows).
     """
-    all_rel, all_gram, all_tog = [], [], []
-    per_concept: dict = {}
-
-    for concept_idx, concept_name in enumerate(concept_set):
-        texts = (
-            decoded_texts_by_concept[concept_idx]
-            if concept_idx < len(decoded_texts_by_concept) else []
+    assert len(texts) == len(user_turns)
+    out: List[float] = [float("nan")] * len(texts)
+    if not texts:
+        return out
+    groups: Dict[str, List[int]] = {}
+    for i, turn in enumerate(user_turns):
+        groups.setdefault(turn, []).append(i)
+    for turn, idxs in groups.items():
+        sub_texts = [texts[i] for i in idxs]
+        scores = _raw_logits_for_texts(
+            rm_model, rm_tokenizer, sub_texts, turn,
+            rm_device, rm_batch_size, rm_max_text_len,
         )
-        if not texts:
-            per_concept[concept_name] = {
-                "n": 0,
-                "rm_relevance_mean": float("nan"),
-                "rm_grammar_mean": float("nan"),
-                "rm_together_mean": float("nan"),
-            }
+        for i, s in zip(idxs, scores):
+            out[i] = float(s)
+    return out
+
+
+def run_rm_metrics_per_solution(
+    generations_by_mode: Dict[str, dict],
+    concept_set: List[str],
+    rm_model,
+    rm_tokenizer,
+    rm_device,
+    *,
+    rm_batch_size: int = 0,
+    rm_max_text_len: int = 500,
+    use_extracted_code: bool = False,
+    audit_jsonl_root: Optional[str] = None,
+) -> Dict[str, Any]:
+    """RM scoring (relevance / grammar / together) over per-solution test-set generations.
+
+    Each ``generations_by_mode[steer_mode]`` payload comes from
+    :func:`run_codecontests_testset_evaluation_for_cbm`. For each problem the user-turn
+    for relevance / together is built from that problem's ``cf_tags`` joined by commas
+    via :data:`RM_USER_RELEVANCE_MULTI` / :data:`RM_USER_TOGETHER_MULTI`.
+    Grammar uses the concept-agnostic :data:`RM_USER_GRAMMAR`.
+
+    The reward-model forward + tokenization helpers (``_make_rm_formatted``,
+    ``_raw_logits_for_texts``) and ``load_reward_model`` are reused unchanged.
+    """
+    if not generations_by_mode:
+        return {}
+
+    results_by_mode: Dict[str, Any] = {}
+
+    for steer_mode, payload in generations_by_mode.items():
+        if not payload:
+            continue
+        raw_outputs = payload.get("raw_outputs") or []
+        extracted_codes = payload.get("extracted_codes") or []
+        cf_tags_per_problem = payload.get("cf_tags_per_problem") or []
+        problem_names = payload.get("problem_names") or [
+            f"problem_{i}" for i in range(len(raw_outputs))
+        ]
+
+        keep: List[int] = []
+        for i, tags in enumerate(cf_tags_per_problem):
+            if tags and any(str(t).strip() for t in tags):
+                keep.append(i)
+        if not keep:
+            print(f"  cc/{steer_mode}: no rows with cf_tags; skipping RM scoring.")
             continue
 
-        u_rel = RM_USER_RELEVANCE.format(concept_name=concept_name)
-        u_tog = RM_USER_TOGETHER.format(concept_name=concept_name)
+        if use_extracted_code:
+            texts = [
+                (extracted_codes[i] if i < len(extracted_codes) and extracted_codes[i]
+                 else (raw_outputs[i] if i < len(raw_outputs) else ""))
+                for i in keep
+            ]
+        else:
+            texts = [raw_outputs[i] if i < len(raw_outputs) else "" for i in keep]
 
-        rel = _raw_logits_for_texts(
-            rm_model, rm_tokenizer, texts, u_rel, rm_device, rm_batch_size, rm_max_text_len,
+        rel_turns = [
+            RM_USER_RELEVANCE_MULTI.format(concepts=_format_concepts_for_rm(cf_tags_per_problem[i]))
+            for i in keep
+        ]
+        tog_turns = [
+            RM_USER_TOGETHER_MULTI.format(concepts=_format_concepts_for_rm(cf_tags_per_problem[i]))
+            for i in keep
+        ]
+        gram_turns = [RM_USER_GRAMMAR] * len(keep)
+
+        print(f"  cc/{steer_mode}: scoring RM on {len(keep)} solutions ...", flush=True)
+        rel = _rm_score_grouped(
+            rm_model, rm_tokenizer, rm_device, rm_batch_size, rm_max_text_len, texts, rel_turns,
         )
-        gram = _raw_logits_for_texts(
-            rm_model, rm_tokenizer, texts, RM_USER_GRAMMAR, rm_device, rm_batch_size, rm_max_text_len,
+        gram = _rm_score_grouped(
+            rm_model, rm_tokenizer, rm_device, rm_batch_size, rm_max_text_len, texts, gram_turns,
         )
-        tog = _raw_logits_for_texts(
-            rm_model, rm_tokenizer, texts, u_tog, rm_device, rm_batch_size, rm_max_text_len,
+        tog = _rm_score_grouped(
+            rm_model, rm_tokenizer, rm_device, rm_batch_size, rm_max_text_len, texts, tog_turns,
         )
 
-        all_rel.extend(rel)
-        all_gram.extend(gram)
-        all_tog.extend(tog)
+        def _ms(xs: Sequence[float]):
+            arr = np.array([x for x in xs if not (isinstance(x, float) and np.isnan(x))], dtype=np.float64)
+            if arr.size == 0:
+                return float("nan"), 0.0
+            return float(arr.mean()), float(arr.std()) if arr.size > 1 else 0.0
 
-        per_concept[concept_name] = {
-            "n": len(texts),
-            "rm_relevance_mean": float(np.mean(rel)) if rel else float("nan"),
-            "rm_grammar_mean": float(np.mean(gram)) if gram else float("nan"),
-            "rm_together_mean": float(np.mean(tog)) if tog else float("nan"),
+        r_m, r_s = _ms(rel)
+        g_m, g_s = _ms(gram)
+        t_m, t_s = _ms(tog)
+
+        mode_metrics = {
+            f"cc/{steer_mode}/rm_relevance_mean": r_m,
+            f"cc/{steer_mode}/rm_relevance_std": r_s,
+            f"cc/{steer_mode}/rm_grammar_mean": g_m,
+            f"cc/{steer_mode}/rm_grammar_std": g_s,
+            f"cc/{steer_mode}/rm_together_mean": t_m,
+            f"cc/{steer_mode}/rm_together_std": t_s,
+            f"cc/{steer_mode}/rm_total_n": int(len(keep)),
+        }
+        safe_wandb_log(mode_metrics)
+        print(
+            f"  cc/{steer_mode}: rm_relevance_mean={r_m:.4f} rm_grammar_mean={g_m:.4f} "
+            f"rm_together_mean={t_m:.4f} (n={len(keep)})"
+        )
+
+        per_problem: List[Dict[str, Any]] = []
+        for k, i in enumerate(keep):
+            per_problem.append(
+                {
+                    "steer_mode": steer_mode,
+                    "problem_idx": int(i),
+                    "problem_name": problem_names[i] if i < len(problem_names) else f"problem_{i}",
+                    "cf_tags": list(cf_tags_per_problem[i]),
+                    "rm_relevance_logit": rel[k],
+                    "rm_grammar_logit": gram[k],
+                    "rm_together_logit": tog[k],
+                }
+            )
+
+        audit_path: Optional[str] = None
+        output_path = payload.get("output_path")
+        if output_path:
+            p = Path(output_path)
+            audit_path = str(p.with_name(p.stem + ".rm.jsonl"))
+        elif audit_jsonl_root:
+            Path(audit_jsonl_root).mkdir(parents=True, exist_ok=True)
+            audit_path = str(Path(audit_jsonl_root) / f"{steer_mode}.rm.jsonl")
+        if audit_path:
+            with open(audit_path, "w", encoding="utf-8") as f:
+                for row in per_problem:
+                    f.write(json.dumps(row) + "\n")
+            print(f"  Saved RM audit → {audit_path}")
+
+        results_by_mode[steer_mode] = {
+            "metrics": mode_metrics,
+            "audit_path": audit_path,
+            "rows": per_problem,
         }
 
-        for b, (t, r, g, o) in enumerate(zip(texts, rel, gram, tog)):
-            safe_wandb_log({
-                f"rm_sample_{concept_name}_{b + 1}": t,
-                f"rm_relevance_logit_{concept_name}_{b + 1}": r,
-                f"rm_grammar_logit_{concept_name}_{b + 1}": g,
-                f"rm_together_logit_{concept_name}_{b + 1}": o,
-            })
-
-    def _ms(xs):
-        if not xs:
-            return float("nan"), 0.0
-        a = np.array(xs, dtype=np.float64)
-        return float(a.mean()), float(a.std()) if a.size > 1 else 0.0
-
-    r_m, r_s = _ms(all_rel)
-    g_m, g_s = _ms(all_gram)
-    t_m, t_s = _ms(all_tog)
-
-    global_metrics = {
-        "rm_relevance_mean": r_m, "rm_relevance_std": r_s,
-        "rm_grammar_mean": g_m, "rm_grammar_std": g_s,
-        "rm_together_mean": t_m, "rm_together_std": t_s,
-        "rm_total_n": len(all_rel),
-    }
-    safe_wandb_log(global_metrics)
-    print(
-        f"  rm_relevance_mean={r_m:.4f} rm_grammar_mean={g_m:.4f} "
-        f"rm_together_mean={t_m:.4f} (n={len(all_rel)})"
-    )
-
-    return {**global_metrics, "per_concept": per_concept}
+    return results_by_mode

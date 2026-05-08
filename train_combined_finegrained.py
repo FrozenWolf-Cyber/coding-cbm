@@ -23,21 +23,18 @@ from utils import (
     build_intervened_concepts_from_similarity,
     compute_multilabel_concept_metrics,
 )
-from steerability_cache import save_all_steerability_texts, steerability_output_root
 from eval_metrics import (
     _format_host_memory_stats,
     set_seed,
     get_intervention_value,
-    generate_steerability_texts,
-    run_steerability_mpnet,
     run_concept_accuracy_cosine,
     run_weight_analysis,
-    generate_perplexity_texts,
     compute_perplexity,
     load_reward_model,
-    run_rm_metrics,
-    run_steerability_llamacpp_judge,
-    run_codecontests_evaluation_for_cbm,
+    run_rm_metrics_per_solution,
+    run_llamacpp_judge_per_solution,
+    run_codecontests_testset_evaluation_for_cbm,
+    run_livecodebench_benchmark_generation_for_cbm,
 )
 from shared_code_prompt import (
     LCB_LLAMA3_INSTRUCT_MODEL_ID,
@@ -187,12 +184,6 @@ parser.add_argument("--epoch_multiplier", type=int, default=1, help="Epoch multi
 parser.add_argument("--max_length", type=int, default=1024)
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument(
-    "--samples_per_concept",
-    type=int,
-    default=50,
-    help="Steerability evaluation: samples per concept. Default 50.",
-)
 
 parser.add_argument("--discrimination_loss", type=float, default=1.0)
 parser.add_argument("--neg_entropy_loss", type=float, default=1.0)
@@ -240,11 +231,6 @@ parser.add_argument("--concept_loss_type", type=str, default="ce", help="Type of
 parser.add_argument("--labeling", type=str, default="direct", choices=["direct"], help="Concept label source. 'direct' uses CF tags from the dataset.")
 
 parser.add_argument(
-    "--mpnet_eval",
-    action="store_true",
-    help="Run MPNet-based steerability evaluation.",
-)
-parser.add_argument(
     "--add_llama_logits",
     action="store_true",
     help=(
@@ -256,47 +242,51 @@ parser.add_argument("--rm_model_name", type=str, default="Skywork/Skywork-Reward
                     help="HF id for sequence-classification reward model.")
 parser.add_argument("--rm_batch_size", type=int, default=0, help="0 = score all texts per chunk in one forward.")
 parser.add_argument("--rm_max_text_len", type=int, default=500)
-parser.add_argument("--skip_rm", action="store_true", help="Skip RM reward evaluation after training.")
+parser.add_argument(
+    "--skip_rm",
+    action="store_true",
+    help="Skip RM (Skywork) per-solution scoring on code_contests test-set generations.",
+)
 parser.add_argument(
     "--skip_llamacpp_steer_eval",
     action="store_true",
-    help="Skip llama.cpp judge-based steerability evaluation.",
+    help="Skip llama.cpp multi-label judge on code_contests test-set generations.",
 )
 parser.add_argument(
     "--llamacpp_eval_model_repo_id",
     type=str,
     default="unsloth/Qwen3.5-27B-GGUF",
-    help="HF repo id for llama.cpp steerability judge.",
+    help="HF repo id for llama.cpp per-solution judge.",
 )
 parser.add_argument(
     "--llamacpp_eval_model_filename",
     type=str,
     default="Qwen3.5-27B-Q8_0.gguf",
-    help="GGUF filename for llama.cpp steerability judge.",
+    help="GGUF filename for llama.cpp per-solution judge.",
 )
 parser.add_argument(
     "--llamacpp_eval_n_ctx",
     type=int,
     default=2048,
-    help="Context size for llama.cpp steerability judge.",
+    help="Context size for llama.cpp per-solution judge.",
 )
 parser.add_argument(
     "--llamacpp_eval_max_tokens",
     type=int,
-    default=64,
-    help="Max tokens for llama.cpp judge output.",
+    default=128,
+    help="Max tokens for llama.cpp judge output (multi-label list).",
 )
 parser.add_argument(
     "--llamacpp_eval_repeat_penalty",
     type=float,
     default=1.15,
-    help="Repeat penalty for llama.cpp steerability judge.",
+    help="Repeat penalty for llama.cpp per-solution judge.",
 )
 parser.add_argument(
     "--llamacpp_eval_temperature",
     type=float,
     default=0.1,
-    help="Temperature for llama.cpp steerability judge.",
+    help="Temperature for llama.cpp per-solution judge.",
 )
 parser.add_argument(
     "--code_results_root",
@@ -643,7 +633,6 @@ if __name__ == "__main__":
 
     # ── Use hard static concept set from shared config ────────────────────
     concept_set = list(CODEFORCES_CONCEPT_SET)
-    concept_set_for_similarity = concept_set
     if not concept_set:
         raise ValueError("CODEFORCES_CONCEPT_SET is empty in config.py.")
     print(f"concept set ({len(concept_set)}): {concept_set[:10]} ...")
@@ -710,7 +699,7 @@ if __name__ == "__main__":
     del train_dataset_raw, valid_dataset_raw, test_dataset_raw
     gc.collect()
 
-    # concept_set already built above from CF tags; concept_set_for_similarity == concept_set
+    # concept_set already built above from CF tags.
     print("concept len: ", len(concept_set))
     hm_stats = _format_host_memory_stats()
     if hm_stats:
@@ -1229,37 +1218,7 @@ if __name__ == "__main__":
 
     # ── Configure evaluation ──
     intervention_value = get_intervention_value(DATASET)
-    num_steerability_samples = (
-        max(1, args.samples_per_concept)
-        if args.samples_per_concept is not None
-        else max(1, 100 // len(concept_set))
-    )
-    steer_root = steerability_output_root(os.path.normpath(prefix.rstrip("/")), best_epoch, False)
-    print(f"Steerability sample cache: {steer_root}")
-
-    # ── Generate steerability texts (cached) ──
     set_seed(args.seed)
-    decoded_texts_by_concept = generate_steerability_texts(
-        preLM, cbl, tokenizer, concept_set, DATASET, device,
-        samples_per_concept=num_steerability_samples,
-        llama_vocab_weight=llama_vocab_weight,
-        keep_other_concepts=args.intervention_keep_other_concepts,
-        steerability_cache_dir=steer_root,
-        steerability_cache_seed=args.seed,
-        interventions_per_batch=max(1, int(args.lcb_prompt_batch_size)),
-    )
-
-    # ── Generate perplexity texts (cached) ──
-    ppl_texts = generate_perplexity_texts(
-        cbl, preLM, tokenizer, args.seed, device,
-        cache_dir=prefix, run_name=run_name,
-        llama_vocab_weight=llama_vocab_weight,
-    )
-
-    # ── Perplexity computation first (fast debug fail path) ──
-    # evaluate library loads its own LLM; run this before other evals so
-    # perplexity API/environment issues surface immediately.
-    compute_perplexity(ppl_texts)
 
     # ── Concept accuracy ──
     # Pass test multi-hot labels directly (built from CF tags above).
@@ -1278,6 +1237,7 @@ if __name__ == "__main__":
     run_weight_analysis(cbl, concept_set, tokenizer)
 
     # ── Final generation: code_contests + LiveCodeBench outputs only (no grading) ──
+    cc_generations_by_mode: dict = {}
     try:
         print(
             "[pre-code-eval] Dropping training loaders / HF train & valid splits / similarity matrices "
@@ -1301,11 +1261,15 @@ if __name__ == "__main__":
             hm = _format_host_memory_stats()
             if hm:
                 print(f"[pre-code-eval] {hm}", flush=True)
-        print("[pre-code-eval] gc/cuda done; calling run_codecontests_evaluation_for_cbm ...", flush=True)
+        print("[pre-code-eval] gc/cuda done; running code_contests test-set eval + LiveCodeBench separately ...", flush=True)
 
         lcb_steer_modes = [m.strip() for m in args.lcb_steer_modes.split(",") if m.strip()]
-        print(f"Running code generation evaluation  (steer_modes={lcb_steer_modes}) ...")
-        run_codecontests_evaluation_for_cbm(
+
+        steer_value = get_intervention_value(DATASET)
+        print(f"Running code generation eval (steer_modes={lcb_steer_modes}) ...", flush=True)
+
+        print("[pre-code-eval] Running code_contests test-set generation + metrics ...", flush=True)
+        cc_results = run_codecontests_testset_evaluation_for_cbm(
             preLM=preLM,
             cbl=cbl,
             tokenizer=tokenizer,
@@ -1327,18 +1291,59 @@ if __name__ == "__main__":
             display=not debug_mode,
             # Steering
             steer_modes=lcb_steer_modes,
-            steer_value=get_intervention_value(DATASET),
+            steer_value=steer_value,
             keep_other_concepts=args.intervention_keep_other_concepts,
-            # LiveCodeBench generation
-            livecodebench_release=args.livecodebench_release,
-            lcb_n_samples=args.lcb_n_samples,
-            lcb_temperature=args.lcb_temperature,
-            lcb_top_p=args.lcb_top_p,
-            lcb_max_new_tokens=args.lcb_max_new_tokens,
+            # Preview
             print_extracted_code_preview=args.print_extracted_code_preview,
             extracted_preview_chars=args.extracted_preview_chars,
             eval_log_host_memory=eval_log_host_memory,
         )
+
+        # Per-mode payloads from the cc test-set run (raw_outputs, extracted_codes,
+        # cf_tags_per_problem, problem_names) — consumed by the post-release evals
+        # below once preLM/cbl are off the GPU.
+        cc_generations_by_mode = {}
+        if isinstance(cc_results, dict):
+            for _mode in lcb_steer_modes:
+                _entry = cc_results.get(f"cc/{_mode}")
+                if isinstance(_entry, dict) and isinstance(_entry.get("generations"), dict):
+                    cc_generations_by_mode[_mode] = _entry["generations"]
+
+        # Ensure we can free HF test split refs even if the eval crashes.
+        if isinstance(_code_eval_test_holder, list) and _code_eval_test_holder:
+            _code_eval_test_holder[0] = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # ── (2) LiveCodeBench benchmark ───────────────────────────────────────
+
+        # print("[pre-code-eval] Running LiveCodeBench benchmark generation + eval locks ...", flush=True)
+        # run_livecodebench_benchmark_generation_for_cbm(
+        #     preLM=preLM,
+        #     cbl=cbl,
+        #     tokenizer=tokenizer,
+        #     concept_set=concept_set,
+        #     seed=args.seed,
+        #     batch_size=args.lcb_prompt_batch_size,
+        #     model_label=f"CBM-Llama3-{DATASET}",
+        #     layer_idx=best_epoch,
+        #     run_id=run_name,
+        #     llama_vocab_weight=llama_vocab_weight,
+        #     display=not debug_mode,
+        #     # Steering
+        #     steer_modes=lcb_steer_modes,
+        #     steer_value=steer_value,
+        #     keep_other_concepts=args.intervention_keep_other_concepts,
+        #     # LiveCodeBench generation
+        #     livecodebench_release=args.livecodebench_release,
+        #     lcb_n_samples=args.lcb_n_samples,
+        #     lcb_temperature=args.lcb_temperature,
+        #     lcb_top_p=args.lcb_top_p,
+        #     lcb_max_new_tokens=args.lcb_max_new_tokens,
+        #     print_extracted_code_preview=args.print_extracted_code_preview,
+        #     extracted_preview_chars=args.extracted_preview_chars,
+        #     eval_log_host_memory=eval_log_host_memory,
+        # )
     except Exception as code_eval_err:
         import traceback
         print(f"Code generation evaluation failed (non-fatal):\n{traceback.format_exc()}")
@@ -1352,48 +1357,62 @@ if __name__ == "__main__":
     gc.collect()
     torch.cuda.empty_cache()
 
-    # ── Steerability scoring (MPNet similarity) ──
-    if args.mpnet_eval:
-        run_steerability_mpnet(
-            decoded_texts_by_concept, concept_set_for_similarity,
-            intervention_value, args.max_length, device,
-        )
+    # ── Per-solution evals on code_contests test-set generations ────────────
+    # These run AFTER preLM/cbl are freed, so RM (~8B) and the perplexity LM (~8B)
+    # have GPU room. Each mode (e.g. "none" before steering, "groundtruth" after
+    # steering) is scored independently; metrics are keyed under cc/{steer_mode}/.
+    if not cc_generations_by_mode:
+        print("No code_contests test-set generations available; skipping per-solution evals.")
     else:
-        print("Skipping MPNet steerability evaluation.")
+        # Perplexity per steer_mode (uses raw_outputs verbatim).
+        for _mode, _payload in cc_generations_by_mode.items():
+            _texts = _payload.get("raw_outputs") or []
+            if not _texts:
+                print(f"cc/{_mode}: no raw outputs; skipping perplexity.")
+                continue
+            try:
+                print(f"\n[cc/{_mode}] Computing perplexity over {len(_texts)} test-set generations ...", flush=True)
+                _ppl = compute_perplexity(_texts)
+                wandb_log({f"cc/{_mode}/{k}": v for k, v in _ppl.items()})
+            except Exception as ppl_err:
+                print(f"cc/{_mode}: perplexity failed (non-fatal): {ppl_err}")
 
-    # ── Steerability scoring (llama.cpp judge) ──
-    if not args.skip_llamacpp_steer_eval:
-        try:
-            run_steerability_llamacpp_judge(
-                decoded_texts_by_concept=decoded_texts_by_concept,
-                concept_set=concept_set,
-                model_repo_id=args.llamacpp_eval_model_repo_id,
-                model_filename=args.llamacpp_eval_model_filename,
-                cache_dir=llamacpp_cache_dir,
-                n_ctx=args.llamacpp_eval_n_ctx,
-                max_tokens=args.llamacpp_eval_max_tokens,
-                repeat_penalty=args.llamacpp_eval_repeat_penalty,
-                temperature=args.llamacpp_eval_temperature,
-            )
-        except Exception as llama_eval_err:
-            print(f"llama.cpp steerability evaluation failed (non-fatal): {llama_eval_err}")
-    else:
-        print("Skipping llama.cpp steerability evaluation.")
+        # llama.cpp multi-label judge per solution, scored against ground-truth cf_tags.
+        if not args.skip_llamacpp_steer_eval:
+            try:
+                run_llamacpp_judge_per_solution(
+                    generations_by_mode=cc_generations_by_mode,
+                    concept_set=concept_set,
+                    model_repo_id=args.llamacpp_eval_model_repo_id,
+                    model_filename=args.llamacpp_eval_model_filename,
+                    cache_dir=llamacpp_cache_dir,
+                    n_ctx=args.llamacpp_eval_n_ctx,
+                    max_tokens=args.llamacpp_eval_max_tokens,
+                    repeat_penalty=args.llamacpp_eval_repeat_penalty,
+                    temperature=args.llamacpp_eval_temperature,
+                )
+            except Exception as llama_eval_err:
+                print(f"llama.cpp per-solution judge failed (non-fatal): {llama_eval_err}")
+        else:
+            print("Skipping llama.cpp per-solution judge.")
 
-    # ── RM reward scoring (optional) ──
-    if not args.skip_rm:
-        try:
-            rm_model, rm_tokenizer_rm = load_reward_model(args.rm_model_name, device)
-            run_rm_metrics(
-                decoded_texts_by_concept, concept_set,
-                rm_model, rm_tokenizer_rm, device,
-                rm_batch_size=args.rm_batch_size,
-                rm_max_text_len=args.rm_max_text_len,
-            )
-            del rm_model, rm_tokenizer_rm
-            torch.cuda.empty_cache()
-        except Exception as rm_err:
-            print(f"RM evaluation failed (non-fatal): {rm_err}")
-
-    # ── Save steerability text cache ──
-    save_all_steerability_texts(steer_root, args.seed, concept_set, decoded_texts_by_concept)
+        # RM scoring per solution (relevance / grammar / together) with multi-concept prompts.
+        if not args.skip_rm:
+            try:
+                rm_model, rm_tokenizer_rm = load_reward_model(args.rm_model_name, device)
+                run_rm_metrics_per_solution(
+                    generations_by_mode=cc_generations_by_mode,
+                    concept_set=concept_set,
+                    rm_model=rm_model,
+                    rm_tokenizer=rm_tokenizer_rm,
+                    rm_device=device,
+                    rm_batch_size=args.rm_batch_size,
+                    rm_max_text_len=args.rm_max_text_len,
+                )
+                del rm_model, rm_tokenizer_rm
+                gc.collect()
+                torch.cuda.empty_cache()
+            except Exception as rm_err:
+                print(f"RM per-solution scoring failed (non-fatal): {rm_err}")
+        else:
+            print("Skipping RM per-solution scoring.")
