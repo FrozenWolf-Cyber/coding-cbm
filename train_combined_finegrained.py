@@ -979,6 +979,47 @@ if __name__ == "__main__":
             log["epoch"] = e + 1
             log["batch"] = i + 1
             wandb_log(log)
+
+            # Explicitly release per-step tensors to curb CUDA fragmentation/OOM in long runs.
+            del (
+                features,
+                concepts,
+                unsup,
+                vocabs,
+                matched_unsup,
+                c_slice,
+                batch_sim_slice,
+                valid_c,
+                valid_sim,
+                loss,
+                reg,
+                concept_loss,
+                word_loss,
+                word_label,
+                batch,
+                batch_sim,
+            )
+            if "classification" in locals():
+                del classification
+            if "discrimination_loss" in locals():
+                del discrimination_loss
+            if "neg_entropy_loss" in locals():
+                del neg_entropy_loss
+            if "residual_contrib" in locals():
+                del residual_contrib
+            if "residual_penalty" in locals():
+                del residual_penalty
+            if "intervened_concept" in locals():
+                del intervened_concept
+            if "vocab" in locals():
+                del vocab
+            if "intervention_gen_loss" in locals():
+                del intervention_gen_loss
+            if "orthogonal_loss" in locals():
+                del orthogonal_loss
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
             if debug_mode and (i + 1) >= debug_max_steps_per_epoch:
                 break
@@ -990,6 +1031,9 @@ if __name__ == "__main__":
                 avg_metrics[key] = sum(training_losses[key]) / len(training_losses[key])
         print("Epoch ", e + 1, " training losses: ", avg_metrics)
         wandb_log({f"avg_{k}": avg_metrics[k] for k in avg_metrics.keys()})
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Validation: concept-tag metrics + validation loss by epoch.
         preLM.eval()
@@ -1100,6 +1144,39 @@ if __name__ == "__main__":
                 val_losses["residual_penalty_loss"].append(float(val_residual_penalty.detach().cpu().item()))
                 val_losses["intervention_gen_loss"].append(float(val_intervention_gen_loss.detach().cpu().item()))
                 val_losses["total_loss"].append(float(val_total_loss.detach().cpu().item()))
+
+                del (
+                    val_features,
+                    val_concepts,
+                    val_unsup,
+                    val_vocabs,
+                    val_matched_unsup,
+                    val_c_slice,
+                    val_batch_sim_slice,
+                    val_valid_c,
+                    val_valid_sim,
+                    val_total_loss,
+                    val_concept_loss,
+                    val_word_loss,
+                    val_reg,
+                    val_orthogonal_loss,
+                    val_residual_penalty,
+                    val_intervention_gen_loss,
+                    val_word_label,
+                    batch,
+                    batch_sim,
+                )
+                if "val_llama_logits" in locals():
+                    del val_llama_logits
+                if "val_residual_contrib" in locals():
+                    del val_residual_contrib
+                if "val_intervened_concept" in locals():
+                    del val_intervened_concept
+                if "val_intervene_vocab" in locals():
+                    del val_intervene_vocab
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             val_pred_tensor = torch.cat(val_preds, dim=0)
             val_target_tensor = torch.cat(val_targets, dim=0)
