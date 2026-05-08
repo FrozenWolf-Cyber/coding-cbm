@@ -1167,6 +1167,17 @@ if __name__ == "__main__":
             print(f"New best checkpoint at epoch {best_epoch} (valid_loss={best_loss:.6f})")
             wandb_log({"best_epoch": best_epoch, "best_valid_loss": best_loss})
 
+    if epochs == 0:
+        # For raw-model benchmarking with 0 training epochs, persist an epoch_0 checkpoint
+        # so downstream evaluation can load a local adapter path consistently.
+        best_epoch = 0
+        print("No training epochs requested; saving initial adapter and CBL as epoch_0 and best.")
+        preLM.save_pretrained(prefix + model_name + "_epoch_0")
+        torch.save(cbl.state_dict(), prefix + cbl_name + "_epoch_0.pt")
+        preLM.save_pretrained(prefix + model_name + "_best")
+        torch.save(cbl.state_dict(), prefix + cbl_name + "_best.pt")
+        wandb_log({"best_epoch": best_epoch})
+
     end = time.time()
     print("time of training CBM:", (end - start) / 3600, "hours")
 
