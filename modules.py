@@ -5,6 +5,153 @@ import torch.nn.functional as F
 from utils import top_k_top_p_filtering, top_k_top_p_filtering_batched
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Bottleneck-mode plumbing (used when CBL/CBLResidual.cbl_layer_idx >= 0).
+# Insert the CBL between Llama decoder layer L and L+1; the rest of the model +
+# original lm_head produce the vocab logits naturally.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _get_llama_model(preLM):
+    """Return the underlying ``LlamaModel`` regardless of PEFT wrapping.
+
+    Handles three layouts seen in this repo:
+      - raw ``LlamaModel`` (eval after ``load_adapter`` on a fresh LlamaModel)
+      - PEFT-wrapped ``LlamaModel`` (training: ``preLM = get_peft_model(LlamaModel, ...)``)
+      - ``LlamaForCausalLM`` (just in case): the inner ``LlamaModel`` is at ``.model``.
+    """
+    base = preLM
+    # Drill through PEFT wrapping (PeftModel.base_model.model -> original model).
+    if hasattr(base, "base_model") and hasattr(base.base_model, "model"):
+        base = base.base_model.model
+    # If we landed on a CausalLM head wrapper, descend once more to the LlamaModel.
+    if not (hasattr(base, "layers") and hasattr(base, "norm")) and hasattr(base, "model"):
+        base = base.model
+    if not (hasattr(base, "layers") and hasattr(base, "norm")):
+        raise RuntimeError(
+            "Could not locate Llama decoder layers + final norm on the given preLM "
+            f"(type={type(preLM).__name__})."
+        )
+    return base
+
+
+def _bottleneck_forward_tail(llama_model, h_L_out, attention_mask, layer_idx):
+    """Run ``layers[layer_idx+1:] + norm`` on ``h_L_out``. Returns ``h_final``.
+
+    Mirrors HuggingFace ``LlamaModel.forward`` for the tail of the stack so we
+    can re-run the post-bottleneck portion on a modified hidden state (used for
+    --intervention_gen_loss in intermediate mode).
+    """
+    bsz, seq_len, _ = h_L_out.shape
+    device = h_L_out.device
+    cache_position = torch.arange(seq_len, device=device)
+    if attention_mask is not None:
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids = position_ids.masked_fill(attention_mask == 0, 1)
+    else:
+        position_ids = cache_position.unsqueeze(0).expand(bsz, -1)
+    causal_mask = llama_model._update_causal_mask(
+        attention_mask, h_L_out, cache_position, None, False,
+    )
+    position_embeddings = llama_model.rotary_emb(h_L_out, position_ids)
+    h = h_L_out
+    for layer in llama_model.layers[layer_idx + 1:]:
+        h = layer(
+            h,
+            attention_mask=causal_mask,
+            position_ids=position_ids,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+        )[0]
+    return llama_model.norm(h)
+
+
+def _bottleneck_step_logits(
+    cbl,
+    preLM,
+    input_ids,
+    past_key_values=None,
+    attention_mask=None,
+    intervene_concepts_fn=None,
+    llama_vocab_weight=None,
+):
+    """One forward step that handles both last-layer and intermediate modes.
+
+    Returns ``(logits, concepts_relu, past_key_values, last_hidden_state)``.
+
+    - ``cbl.cbl_layer_idx == -1``: classic path — preLM forward, ``cbl/unsup/fc``
+      on the last hidden state, optional ``+ llama_logits``.
+    - ``cbl.cbl_layer_idx >= 0``: register a forward hook on layers[L] that runs
+      the bottleneck (with optional intervention) and substitutes its output;
+      vocab logits come from ``F.linear(last_hidden_state, llama_vocab_weight)``.
+
+    ``intervene_concepts_fn`` (optional): callable mutating the *raw* (pre-ReLU)
+    concepts in-place or returning a new tensor; matches the existing
+    in-place mutation semantics in the per-variant generate functions.
+    """
+    use_cache = past_key_values is not None or True
+    fwd_kwargs = {"use_cache": True}
+    if attention_mask is not None:
+        fwd_kwargs["attention_mask"] = attention_mask
+    if past_key_values is not None:
+        fwd_kwargs["past_key_values"] = past_key_values
+
+    if cbl.cbl_layer_idx == -1:
+        outputs = preLM(input_ids, **fwd_kwargs)
+        last_hidden = outputs.last_hidden_state
+        features = last_hidden.float()
+        concepts = cbl.cbl(features)
+        unsup_features = cbl._unsup_branch(features)
+        if intervene_concepts_fn is not None:
+            concepts = intervene_concepts_fn(concepts)
+        logits = cbl.fc(torch.cat((cbl.relu(concepts), unsup_features), dim=-1))
+        if llama_vocab_weight is not None:
+            llama_logits = F.linear(last_hidden.to(llama_vocab_weight.dtype), llama_vocab_weight)
+            logits = logits + llama_logits.to(dtype=logits.dtype)
+        return logits, cbl.relu(concepts), getattr(outputs, "past_key_values", past_key_values), last_hidden
+
+    # Intermediate (bottleneck) mode.
+    if llama_vocab_weight is None:
+        raise ValueError("llama_vocab_weight is required when cbl_layer_idx >= 0 (no fallback lm_head).")
+    llama_model = _get_llama_model(preLM)
+    target_layer = llama_model.layers[cbl.cbl_layer_idx]
+    store: dict = {}
+
+    def _hook(module, args, kwargs, output):
+        h_L = output[0] if isinstance(output, tuple) else output
+        h_L_in_dtype = h_L.dtype
+        feats = h_L.float()
+        concepts = cbl.cbl(feats)
+        unsup = cbl._unsup_branch(feats)
+        if intervene_concepts_fn is not None:
+            concepts = intervene_concepts_fn(concepts)
+        concepts_relu = cbl.relu(concepts)
+        h_L_proj = cbl.proj(torch.cat((concepts_relu, unsup), dim=-1)).to(h_L_in_dtype)
+        if cbl.use_residual:
+            h_L_out = h_L_proj + h_L
+        else:
+            h_L_out = h_L_proj
+        store["concepts"] = concepts_relu
+        store["unsup"] = unsup
+        store["h_L"] = h_L
+        store["h_L_proj"] = h_L_proj
+        if isinstance(output, tuple):
+            return (h_L_out,) + tuple(output[1:])
+        return h_L_out
+
+    handle = target_layer.register_forward_hook(_hook, with_kwargs=True)
+    try:
+        outputs = preLM(input_ids, **fwd_kwargs)
+    finally:
+        handle.remove()
+    last_hidden = outputs.last_hidden_state
+    logits = F.linear(last_hidden.to(llama_vocab_weight.dtype), llama_vocab_weight)
+    return logits, store["concepts"], getattr(outputs, "past_key_values", past_key_values), last_hidden
+
+
 def _safe_multinomial_from_logits(filtered_logits: torch.Tensor) -> torch.Tensor:
     """Sample from logits robustly.
 
@@ -114,7 +261,7 @@ class Llama_baseline_generation(nn.Module):
         return ids
 
 class CBL(nn.Module):
-    def __init__(self, config, concept_dim, tokenizer):
+    def __init__(self, config, concept_dim, tokenizer, cbl_layer_idx: int = -1, use_residual: bool = True):
         super().__init__()
         self.cbl = nn.Linear(config.hidden_size, concept_dim)
         self.unsup = nn.Linear(config.hidden_size, 768)
@@ -126,6 +273,18 @@ class CBL(nn.Module):
         if concept_dim != 768:
             print("Warning: concept_dim and unsup feature dim are not equal so creating a linear layer to match dimensions.")
             self.match_layer = nn.Linear(768, concept_dim)
+        # Bottleneck (intermediate-layer) wiring. Only allocated when requested
+        # so last-layer-mode checkpoints stay byte-identical to before.
+        self.cbl_layer_idx = int(cbl_layer_idx)
+        self.use_residual = bool(use_residual)
+        self.hidden_size = config.hidden_size
+        self.proj = None
+        if self.cbl_layer_idx >= 0:
+            self.proj = nn.Linear(concept_dim + 768, config.hidden_size)
+
+    @property
+    def _unsup_branch(self):
+        return self.unsup
 
     def forward(self, features, llama_logits=None):
         concepts = self.cbl(features)
@@ -136,6 +295,56 @@ class CBL(nn.Module):
             logits = logits + llama_logits.to(dtype=logits.dtype)
         return self.relu(concepts), unsup_features, logits, self.match_layer(unsup_features) if self.match_layer else unsup_features
 
+    def forward_full(self, preLM, input_ids, attention_mask=None, llama_vocab_weight=None):
+        """Run the full backbone + CBL/bottleneck. Mode is selected by ``cbl_layer_idx``.
+
+        Returns ``(concepts_relu, unsup, vocabs, matched_unsup, h_L, h_L_proj)``.
+        ``h_L`` and ``h_L_proj`` are ``None`` in last-layer mode.
+        """
+        if self.cbl_layer_idx == -1:
+            features = preLM(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+            llama_logits = (
+                F.linear(features, llama_vocab_weight) if llama_vocab_weight is not None else None
+            )
+            concepts, unsup, vocabs, matched = self.forward(features.float(), llama_logits=llama_logits)
+            return concepts, unsup, vocabs, matched, None, None
+        if llama_vocab_weight is None:
+            raise ValueError("llama_vocab_weight is required when cbl_layer_idx >= 0.")
+        llama_model = _get_llama_model(preLM)
+        target_layer = llama_model.layers[self.cbl_layer_idx]
+        store: dict = {}
+
+        def _hook(module, args, kwargs, output):
+            h_L = output[0] if isinstance(output, tuple) else output
+            feats = h_L.float()
+            concepts_raw = self.cbl(feats)
+            unsup = self.unsup(feats)
+            concepts_relu = self.relu(concepts_raw)
+            h_L_proj_f = self.proj(torch.cat((concepts_relu, unsup), dim=-1))
+            h_L_proj = h_L_proj_f.to(h_L.dtype)
+            if self.use_residual:
+                h_L_out = h_L_proj + h_L
+            else:
+                h_L_out = h_L_proj
+            store["concepts"] = concepts_relu
+            store["unsup"] = unsup
+            store["h_L"] = h_L
+            store["h_L_proj"] = h_L_proj_f
+            if isinstance(output, tuple):
+                return (h_L_out,) + tuple(output[1:])
+            return h_L_out
+
+        handle = target_layer.register_forward_hook(_hook, with_kwargs=True)
+        try:
+            outputs = preLM(input_ids=input_ids, attention_mask=attention_mask)
+        finally:
+            handle.remove()
+        h_final = outputs.last_hidden_state
+        vocabs = F.linear(h_final.to(llama_vocab_weight.dtype), llama_vocab_weight)
+        unsup = store["unsup"]
+        matched = self.match_layer(unsup) if self.match_layer else unsup
+        return store["concepts"], unsup, vocabs, matched, store["h_L"], store["h_L_proj"]
+
     def intervene(self, unsup_features, intervene, llama_logits=None):
         concepts = intervene
         e = torch.cat((self.relu(concepts), unsup_features), dim=-1)
@@ -144,21 +353,41 @@ class CBL(nn.Module):
             logits = logits + llama_logits.to(dtype=logits.dtype)
         return logits
 
+    def intervene_full(self, preLM, h_L, attention_mask, intervened_concepts, unsup_features, llama_vocab_weight):
+        """Tail-only re-forward for intervention loss in intermediate mode.
+
+        Reuses the cached ``h_L`` (from the un-intervened forward) so we do *not*
+        rerun layers[0..L]; only ``proj``, layers[L+1:], the final norm and lm_head.
+        """
+        if self.cbl_layer_idx == -1:
+            raise RuntimeError("intervene_full is only valid in intermediate mode (cbl_layer_idx >= 0).")
+        h_L_proj_f = self.proj(torch.cat((self.relu(intervened_concepts), unsup_features), dim=-1))
+        h_L_proj = h_L_proj_f.to(h_L.dtype)
+        h_L_out = (h_L_proj + h_L) if self.use_residual else h_L_proj
+        llama_model = _get_llama_model(preLM)
+        h_final = _bottleneck_forward_tail(llama_model, h_L_out, attention_mask, self.cbl_layer_idx)
+        return F.linear(h_final.to(llama_vocab_weight.dtype), llama_vocab_weight)
+
     def generate(self, ids, preLM, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001, llama_vocab_weight=None):
         past_key_values = None
-        for i in range(length):
-            outputs = preLM(ids[:, -1:] if past_key_values is not None else ids, past_key_values=past_key_values, use_cache=True)
-            past_key_values = outputs.past_key_values
-            features = outputs.last_hidden_state.float()
-            concepts = self.cbl(features)
-            unsup_features = self.unsup(features)
+
+        def _intervene_fn(concepts):
             if intervene:
                 for j in range(self.concept_dim):
                     concepts[0, :, j] = intervene[j]
-            logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
-            if llama_vocab_weight is not None:
-                llama_logits = F.linear(outputs.last_hidden_state.to(llama_vocab_weight.dtype), llama_vocab_weight)
-                logits = logits + llama_logits.to(dtype=logits.dtype)
+            return concepts
+
+        concepts = None
+        for i in range(length):
+            input_ids = ids[:, -1:] if past_key_values is not None else ids
+            logits, concepts, past_key_values, _ = _bottleneck_step_logits(
+                self,
+                preLM,
+                input_ids,
+                past_key_values=past_key_values,
+                intervene_concepts_fn=_intervene_fn if intervene else None,
+                llama_vocab_weight=llama_vocab_weight,
+            )
             score = logits[:, -1, ids[0]]
             score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
             logits[:, -1, ids[0]] = score
@@ -168,7 +397,7 @@ class CBL(nn.Module):
             ids = torch.cat((ids, next_token), dim=-1)
             if eos_token_id is not None and next_token.item() == eos_token_id:
                 break
-        return ids, self.relu(concepts)[0]
+        return ids, concepts[0] if concepts is not None else None
 
     def generate_batch(
         self,
@@ -190,17 +419,8 @@ class CBL(nn.Module):
         finished = torch.zeros(num_samples, dtype=torch.bool, device=ids.device)
         past_key_values = None
         concepts = None
-        for i in range(length):
-            input_ids = ids[:, -1:] if past_key_values is not None else ids
-            outputs = preLM(input_ids, past_key_values=past_key_values, use_cache=True)
-            past_key_values = outputs.past_key_values
-            features = outputs.last_hidden_state.float()
-            concepts = self.cbl(features)
-            unsup_features = self.unsup(features)
 
-            # Intervention application (default behavior preserved):
-            # - keep_other_concepts=False: overwrite *all* concept dims from `intervene` (including zeros)
-            # - keep_other_concepts=True: overwrite only dims where `intervene[j] != 0`, leaving others as-is
+        def _intervene_fn(concepts):
             if intervene and not keep_other_concepts:
                 for j in range(self.concept_dim):
                     concepts[:, :, j] = intervene[j]
@@ -211,11 +431,18 @@ class CBL(nn.Module):
                         val = val.item()
                     if val != 0:
                         concepts[:, :, j] = val
-            logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
-            if llama_vocab_weight is not None:
-                llama_logits = F.linear(outputs.last_hidden_state.to(llama_vocab_weight.dtype), llama_vocab_weight)
-                logits = logits + llama_logits.to(dtype=logits.dtype)
-            # Per-sample repetition penalty
+            return concepts
+
+        for i in range(length):
+            input_ids = ids[:, -1:] if past_key_values is not None else ids
+            logits, concepts, past_key_values, _ = _bottleneck_step_logits(
+                self,
+                preLM,
+                input_ids,
+                past_key_values=past_key_values,
+                intervene_concepts_fn=_intervene_fn if intervene else None,
+                llama_vocab_weight=llama_vocab_weight,
+            )
             for b in range(num_samples):
                 if not finished[b]:
                     score = logits[b, -1, ids[b]].clone()
@@ -230,7 +457,7 @@ class CBL(nn.Module):
                 finished = finished | (next_token.squeeze(-1) == eos_token_id)
             if finished.all():
                 break
-        return ids, self.relu(concepts) if concepts is not None else None
+        return ids, concepts if concepts is not None else None
 
     def generate_intervention_batch_parallel(
         self,
@@ -277,33 +504,29 @@ class CBL(nn.Module):
             if row_apply_mask.numel() == prompt_batch and num_samples > 1:
                 row_apply_mask = row_apply_mask.repeat_interleave(num_samples, dim=0)
 
+        def _intervene_fn(concepts):
+            if row_intervene is None:
+                return concepts
+            iv = row_intervene.to(device=concepts.device, dtype=concepts.dtype).unsqueeze(1).expand_as(concepts)
+            if row_apply_mask is None:
+                apply_mask = torch.ones((total_batch, 1, 1), dtype=torch.bool, device=concepts.device).expand_as(concepts)
+            else:
+                apply_mask = row_apply_mask.view(-1, 1, 1).expand_as(concepts)
+            if keep_other_concepts:
+                apply_mask = apply_mask & (row_intervene.to(device=concepts.device) != 0).unsqueeze(1).expand_as(concepts)
+            return torch.where(apply_mask, iv, concepts)
+
         for _ in range(length):
             input_ids = ids[:, -1:] if past_key_values is not None else ids
-            outputs = preLM(
+            logits, concepts, past_key_values, _ = _bottleneck_step_logits(
+                self,
+                preLM,
                 input_ids,
-                attention_mask=attention_mask,
                 past_key_values=past_key_values,
-                use_cache=True,
+                attention_mask=attention_mask,
+                intervene_concepts_fn=_intervene_fn if row_intervene is not None else None,
+                llama_vocab_weight=llama_vocab_weight,
             )
-            past_key_values = outputs.past_key_values
-            features = outputs.last_hidden_state.float()
-            concepts = self.cbl(features)
-            unsup_features = self.unsup(features)
-
-            if row_intervene is not None:
-                iv = row_intervene.to(device=concepts.device, dtype=concepts.dtype).unsqueeze(1).expand_as(concepts)
-                if row_apply_mask is None:
-                    apply_mask = torch.ones((total_batch, 1, 1), dtype=torch.bool, device=concepts.device).expand_as(concepts)
-                else:
-                    apply_mask = row_apply_mask.view(-1, 1, 1).expand_as(concepts)
-                if keep_other_concepts:
-                    apply_mask = apply_mask & (row_intervene.to(device=concepts.device) != 0).unsqueeze(1).expand_as(concepts)
-                concepts = torch.where(apply_mask, iv, concepts)
-
-            logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
-            if llama_vocab_weight is not None:
-                llama_logits = F.linear(outputs.last_hidden_state.to(llama_vocab_weight.dtype), llama_vocab_weight)
-                logits = logits + llama_logits.to(dtype=logits.dtype)
             for b in range(total_batch):
                 if not finished[b]:
                     token_mask = attention_mask[b].bool()
@@ -322,7 +545,7 @@ class CBL(nn.Module):
                 finished = finished | (next_token.squeeze(-1) == eos_token_id)
             if finished.all():
                 break
-        return ids, self.relu(concepts) if concepts is not None else None
+        return ids, concepts if concepts is not None else None
 
     def generate_multi_concept_batch(
         self,
@@ -371,28 +594,23 @@ class CBL(nn.Module):
         past_key_values = None
         concepts = None
 
-        for i in range(length):
-            input_ids = ids[:, -1:] if past_key_values is not None else ids
-            outputs = preLM(input_ids, past_key_values=past_key_values, use_cache=True)
-            past_key_values = outputs.past_key_values
-            features = outputs.last_hidden_state.float()
-            concepts = self.cbl(features)
-            unsup_features = self.unsup(features)
-
+        def _intervene_fn(concepts):
             iv = intervention_expanded.unsqueeze(1).expand_as(concepts)
             if not keep_other_concepts:
-                concepts = iv.contiguous()
-            else:
-                mask = (intervention_expanded != 0).unsqueeze(1).expand_as(concepts)
-                concepts = torch.where(mask, iv, concepts)
+                return iv.contiguous()
+            mask = (intervention_expanded != 0).unsqueeze(1).expand_as(concepts)
+            return torch.where(mask, iv, concepts)
 
-            logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
-            if llama_vocab_weight is not None:
-                llama_logits = F.linear(
-                    outputs.last_hidden_state.to(llama_vocab_weight.dtype),
-                    llama_vocab_weight,
-                )
-                logits = logits + llama_logits.to(dtype=logits.dtype)
+        for i in range(length):
+            input_ids = ids[:, -1:] if past_key_values is not None else ids
+            logits, concepts, past_key_values, _ = _bottleneck_step_logits(
+                self,
+                preLM,
+                input_ids,
+                past_key_values=past_key_values,
+                intervene_concepts_fn=_intervene_fn,
+                llama_vocab_weight=llama_vocab_weight,
+            )
             for b in range(total_batch):
                 if not finished[b]:
                     score = logits[b, -1, ids[b]].clone()
@@ -408,11 +626,11 @@ class CBL(nn.Module):
             if finished.all():
                 break
 
-        return ids, self.relu(concepts) if concepts is not None else None
+        return ids, concepts if concepts is not None else None
 
 
 class CBLResidual(nn.Module):
-    def __init__(self, config, concept_dim, residual_dim, tokenizer):
+    def __init__(self, config, concept_dim, residual_dim, tokenizer, cbl_layer_idx: int = -1, use_residual: bool = True):
         super().__init__()
         self.cbl = nn.Linear(config.hidden_size, concept_dim)
         self.cbl_residual = nn.Linear(config.hidden_size, residual_dim)
@@ -425,6 +643,16 @@ class CBLResidual(nn.Module):
         if concept_dim != residual_dim:
             print("Warning: concept_dim and residual_dim are not equal so creating a linear layer to match dimensions.")
             self.match_layer = nn.Linear(residual_dim, concept_dim)
+        self.cbl_layer_idx = int(cbl_layer_idx)
+        self.use_residual = bool(use_residual)
+        self.hidden_size = config.hidden_size
+        self.proj = None
+        if self.cbl_layer_idx >= 0:
+            self.proj = nn.Linear(concept_dim + residual_dim, config.hidden_size)
+
+    @property
+    def _unsup_branch(self):
+        return self.cbl_residual
 
     def forward(self, features, llama_logits=None):
         concepts = self.cbl(features)
@@ -437,6 +665,52 @@ class CBLResidual(nn.Module):
             logits = logits + llama_logits.to(dtype=logits.dtype)
         return self.relu(concepts), unsup_features, logits, self.match_layer(unsup_features) if self.match_layer else unsup_features
 
+    def forward_full(self, preLM, input_ids, attention_mask=None, llama_vocab_weight=None):
+        """Run the full backbone + CBL/bottleneck. See ``CBL.forward_full``."""
+        if self.cbl_layer_idx == -1:
+            features = preLM(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+            llama_logits = (
+                F.linear(features, llama_vocab_weight) if llama_vocab_weight is not None else None
+            )
+            concepts, unsup, vocabs, matched = self.forward(features.float(), llama_logits=llama_logits)
+            return concepts, unsup, vocabs, matched, None, None
+        if llama_vocab_weight is None:
+            raise ValueError("llama_vocab_weight is required when cbl_layer_idx >= 0.")
+        llama_model = _get_llama_model(preLM)
+        target_layer = llama_model.layers[self.cbl_layer_idx]
+        store: dict = {}
+
+        def _hook(module, args, kwargs, output):
+            h_L = output[0] if isinstance(output, tuple) else output
+            feats = h_L.float()
+            concepts_raw = self.cbl(feats)
+            unsup = self.cbl_residual(feats)
+            concepts_relu = self.relu(concepts_raw)
+            h_L_proj_f = self.proj(torch.cat((concepts_relu, unsup), dim=-1))
+            h_L_proj = h_L_proj_f.to(h_L.dtype)
+            if self.use_residual:
+                h_L_out = h_L_proj + h_L
+            else:
+                h_L_out = h_L_proj
+            store["concepts"] = concepts_relu
+            store["unsup"] = unsup
+            store["h_L"] = h_L
+            store["h_L_proj"] = h_L_proj_f
+            if isinstance(output, tuple):
+                return (h_L_out,) + tuple(output[1:])
+            return h_L_out
+
+        handle = target_layer.register_forward_hook(_hook, with_kwargs=True)
+        try:
+            outputs = preLM(input_ids=input_ids, attention_mask=attention_mask)
+        finally:
+            handle.remove()
+        h_final = outputs.last_hidden_state
+        vocabs = F.linear(h_final.to(llama_vocab_weight.dtype), llama_vocab_weight)
+        unsup = store["unsup"]
+        matched = self.match_layer(unsup) if self.match_layer else unsup
+        return store["concepts"], unsup, vocabs, matched, store["h_L"], store["h_L_proj"]
+
     def intervene(self, unsup_features, intervene, llama_logits=None):
         concepts = intervene
         e = torch.cat((self.relu(concepts), unsup_features), dim=-1)
@@ -445,22 +719,38 @@ class CBLResidual(nn.Module):
             logits = logits + llama_logits.to(dtype=logits.dtype)
         return logits
 
+    def intervene_full(self, preLM, h_L, attention_mask, intervened_concepts, unsup_features, llama_vocab_weight):
+        """Tail-only re-forward for intervention loss in intermediate mode."""
+        if self.cbl_layer_idx == -1:
+            raise RuntimeError("intervene_full is only valid in intermediate mode (cbl_layer_idx >= 0).")
+        h_L_proj_f = self.proj(torch.cat((self.relu(intervened_concepts), unsup_features), dim=-1))
+        h_L_proj = h_L_proj_f.to(h_L.dtype)
+        h_L_out = (h_L_proj + h_L) if self.use_residual else h_L_proj
+        llama_model = _get_llama_model(preLM)
+        h_final = _bottleneck_forward_tail(llama_model, h_L_out, attention_mask, self.cbl_layer_idx)
+        return F.linear(h_final.to(llama_vocab_weight.dtype), llama_vocab_weight)
+
 
     def generate(self, ids, preLM, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001, llama_vocab_weight=None):
         past_key_values = None
-        for i in range(length):
-            outputs = preLM(ids[:, -1:] if past_key_values is not None else ids, past_key_values=past_key_values, use_cache=True)
-            past_key_values = outputs.past_key_values
-            features = outputs.last_hidden_state.float()
-            concepts = self.cbl(features)
-            unsup_features = self.cbl_residual(features)
+
+        def _intervene_fn(concepts):
             if intervene:
                 for j in range(self.concept_dim):
                     concepts[0, :, j] = intervene[j]
-            logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
-            if llama_vocab_weight is not None:
-                llama_logits = F.linear(outputs.last_hidden_state.to(llama_vocab_weight.dtype), llama_vocab_weight)
-                logits = logits + llama_logits.to(dtype=logits.dtype)
+            return concepts
+
+        concepts = None
+        for i in range(length):
+            input_ids = ids[:, -1:] if past_key_values is not None else ids
+            logits, concepts, past_key_values, _ = _bottleneck_step_logits(
+                self,
+                preLM,
+                input_ids,
+                past_key_values=past_key_values,
+                intervene_concepts_fn=_intervene_fn if intervene else None,
+                llama_vocab_weight=llama_vocab_weight,
+            )
             score = logits[:, -1, ids[0]]
             score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
             logits[:, -1, ids[0]] = score
@@ -470,7 +760,7 @@ class CBLResidual(nn.Module):
             ids = torch.cat((ids, next_token), dim=-1)
             if eos_token_id is not None and next_token.item() == eos_token_id:
                 break
-        return ids, self.relu(concepts)[0]
+        return ids, concepts[0] if concepts is not None else None
 
     def generate_batch(
         self,
@@ -492,17 +782,8 @@ class CBLResidual(nn.Module):
         finished = torch.zeros(num_samples, dtype=torch.bool, device=ids.device)
         past_key_values = None
         concepts = None
-        for i in range(length):
-            input_ids = ids[:, -1:] if past_key_values is not None else ids
-            outputs = preLM(input_ids, past_key_values=past_key_values, use_cache=True)
-            past_key_values = outputs.past_key_values
-            features = outputs.last_hidden_state.float()
-            concepts = self.cbl(features)
-            unsup_features = self.cbl_residual(features)
 
-            # Intervention application (default behavior preserved):
-            # - keep_other_concepts=False: overwrite *all* concept dims from `intervene` (including zeros)
-            # - keep_other_concepts=True: overwrite only dims where `intervene[j] != 0`, leaving others as-is
+        def _intervene_fn(concepts):
             if intervene and not keep_other_concepts:
                 for j in range(self.concept_dim):
                     concepts[:, :, j] = intervene[j]
@@ -513,11 +794,18 @@ class CBLResidual(nn.Module):
                         val = val.item()
                     if val != 0:
                         concepts[:, :, j] = val
-            logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
-            if llama_vocab_weight is not None:
-                llama_logits = F.linear(outputs.last_hidden_state.to(llama_vocab_weight.dtype), llama_vocab_weight)
-                logits = logits + llama_logits.to(dtype=logits.dtype)
-            # Per-sample repetition penalty
+            return concepts
+
+        for i in range(length):
+            input_ids = ids[:, -1:] if past_key_values is not None else ids
+            logits, concepts, past_key_values, _ = _bottleneck_step_logits(
+                self,
+                preLM,
+                input_ids,
+                past_key_values=past_key_values,
+                intervene_concepts_fn=_intervene_fn if intervene else None,
+                llama_vocab_weight=llama_vocab_weight,
+            )
             for b in range(num_samples):
                 if not finished[b]:
                     score = logits[b, -1, ids[b]].clone()
@@ -532,7 +820,7 @@ class CBLResidual(nn.Module):
                 finished = finished | (next_token.squeeze(-1) == eos_token_id)
             if finished.all():
                 break
-        return ids, self.relu(concepts) if concepts is not None else None
+        return ids, concepts if concepts is not None else None
 
     def generate_intervention_batch_parallel(
         self,

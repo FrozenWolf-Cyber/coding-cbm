@@ -27,6 +27,7 @@ Steering modes (set via --cbm_steer_mode):
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -133,22 +134,56 @@ class CBMRunner(BaseRunner):
         residual_dim = getattr(args, "cbm_residual_dim", 768)
         use_cbl = getattr(args, "cbm_use_cbl", False)
 
-        if use_cbl:
-            self.cbl = CBL(config, C, self.tokenizer).to(self.device)
+        # Read sidecar mode metadata so we instantiate the *exact* module shape
+        # (proj layer present iff intermediate mode). Without this the loader
+        # would default to cbl_layer_idx=-1, drop the saved proj.* keys, and
+        # silently route eval through the never-trained cbl.fc head.
+        meta_path = args.cbm_cbl_path + ".meta.json"
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r") as f:
+                _meta = json.load(f)
+            cbl_layer_idx = int(_meta.get("cbl_layer_idx", -1))
+            use_residual = bool(_meta.get("use_residual", True))
+            print(
+                f"[CBMRunner] Loaded sidecar meta {meta_path}: "
+                f"cbl_layer_idx={cbl_layer_idx}, use_residual={use_residual}"
+            )
         else:
-            self.cbl = CBLResidual(config, C, residual_dim, self.tokenizer).to(self.device)
+            cbl_layer_idx = -1
+            use_residual = True
+            print(
+                f"[CBMRunner] No sidecar meta at {meta_path}; "
+                f"defaulting to cbl_layer_idx=-1, use_residual=True"
+            )
+
+        if use_cbl:
+            self.cbl = CBL(
+                config, C, self.tokenizer,
+                cbl_layer_idx=cbl_layer_idx, use_residual=use_residual,
+            ).to(self.device)
+        else:
+            self.cbl = CBLResidual(
+                config, C, residual_dim, self.tokenizer,
+                cbl_layer_idx=cbl_layer_idx, use_residual=use_residual,
+            ).to(self.device)
 
         print(f"[CBMRunner] Loading CBL weights from {args.cbm_cbl_path} ...")
         self.cbl.load_state_dict(
-            torch.load(args.cbm_cbl_path, map_location=self.device)
+            torch.load(args.cbm_cbl_path, map_location=self.device),
+            strict=True,
         )
         self.cbl.eval()
 
-        # ── llama_vocab_weight (optional, for add_llama_logits mode) ──────
+        # ── llama_vocab_weight ──
+        # Required when cbl_layer_idx >= 0 (intermediate mode uses lm_head as
+        # the post-bottleneck vocab projection); also when --cbm_add_llama_logits
+        # is set in last-layer mode (logit residual).
         self.llama_vocab_weight = None
-        if getattr(args, "cbm_add_llama_logits", False):
+        need_vocab_weight = cbl_layer_idx >= 0 or getattr(args, "cbm_add_llama_logits", False)
+        if need_vocab_weight:
             from transformers import AutoModelForCausalLM
-            print("[CBMRunner] Loading LLaMA vocab weight for logit residual ...")
+            reason = "intermediate mode" if cbl_layer_idx >= 0 else "logit residual"
+            print(f"[CBMRunner] Loading LLaMA vocab weight ({reason}) ...")
             lm_head = AutoModelForCausalLM.from_pretrained(
                 "meta-llama/Meta-Llama-3-8B-Instruct", torch_dtype=torch.bfloat16
             ).to(self.device)

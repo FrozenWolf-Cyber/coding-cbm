@@ -1,5 +1,6 @@
 import argparse
 import gc
+import json
 import multiprocessing as mp
 import os
 import time
@@ -213,6 +214,27 @@ parser.add_argument(
 )
 parser.add_argument("--intervention_gen_loss", type=float, default=0.0)
 parser.add_argument("--no_detach_intervention", action='store_true', help="If set, do not detach unsup during intervention generation loss computation.")
+parser.add_argument(
+    "--cbl_layer_idx",
+    type=int,
+    default=-1,
+    help=(
+        "If -1 (default), keep the existing flow (CBL applied to the last hidden state, vocab via cbl.fc). "
+        "If L >= 0, insert the CBL bottleneck between Llama layers L and L+1: "
+        "concepts/unsup are read from h_L, projected back to hidden size via a new proj head, "
+        "and (optionally) added back as a residual h_L_out = h_L_proj + h_L; the rest of Llama + the original lm_head produce vocab logits."
+    ),
+)
+parser.add_argument(
+    "--reconstruction_loss_weight",
+    type=float,
+    default=0.0,
+    help=(
+        "(Intermediate mode only) Weight on MSE(h_L_proj, h_L). "
+        "When > 0 the bottleneck residual is dropped (h_L_out = h_L_proj) so the reconstruction loss "
+        "drives the bottleneck to preserve h_L; mutually exclusive with --add_llama_logits in intermediate mode."
+    ),
+)
 parser.add_argument(
     "--intervention_keep_other_concepts",
     action="store_true",
@@ -526,7 +548,13 @@ def _hf_from_pretrained_cache_first(loader_fn, model_id: str, cache_dir: str, **
 
 
 def _zero_cbl_concept_and_unsup_branches_if_requested(cbl_model, enabled: bool) -> None:
-    """Zero concept + unsupervised/residual branch params when logits-add mode is on."""
+    """Zero concept + unsupervised/residual branch params when logits-add mode is on.
+
+    In last-layer mode this makes ``vocabs ≈ llama_logits`` at init.
+    In intermediate mode (``cbl_layer_idx >= 0``) we *also* zero ``proj`` so that
+    ``h_L_proj = 0`` ⇒ ``h_L_out = h_L`` (when use_residual=True) ⇒ the rest of
+    Llama runs unchanged ⇒ vocabs equal the unmodified base model at step 0.
+    """
     if not enabled:
         return
     with torch.no_grad():
@@ -535,14 +563,42 @@ def _zero_cbl_concept_and_unsup_branches_if_requested(cbl_model, enabled: bool) 
             cbl_model.cbl.bias.zero_()
             cbl_model.unsup.weight.zero_()
             cbl_model.unsup.bias.zero_()
-            print("[init] --add_llama_logits enabled: zeroed CBL concept+unsup branches")
+            extra = ""
+            if cbl_model.cbl_layer_idx >= 0 and cbl_model.proj is not None:
+                cbl_model.proj.weight.zero_()
+                cbl_model.proj.bias.zero_()
+                extra = "+proj"
+            print(f"[init] --add_llama_logits enabled: zeroed CBL concept+unsup{extra} branches")
         elif isinstance(cbl_model, CBLResidual):
             cbl_model.cbl.weight.zero_()
             cbl_model.cbl.bias.zero_()
             cbl_model.cbl_residual.weight.zero_()
             cbl_model.cbl_residual.bias.zero_()
-            print("[init] --add_llama_logits enabled: zeroed CBLResidual concept+residual branches")
+            extra = ""
+            if cbl_model.cbl_layer_idx >= 0 and cbl_model.proj is not None:
+                cbl_model.proj.weight.zero_()
+                cbl_model.proj.bias.zero_()
+                extra = "+proj"
+            print(f"[init] --add_llama_logits enabled: zeroed CBLResidual concept+residual{extra} branches")
 
+
+def _save_cbl_with_meta(cbl_model, cbl_path: str) -> None:
+    """Save the CBL state_dict AND a sidecar ``<cbl_path>.meta.json``.
+
+    The sidecar persists ``cbl_layer_idx`` and ``use_residual`` so that eval-time
+    loaders (eval_metrics.load_model_and_cbl, LiveCodeBench cbm_runner) can
+    reconstruct the *exact* module shape (proj layer present iff intermediate
+    mode) before calling ``load_state_dict(strict=True)``. Without this sidecar
+    the loader would default to ``cbl_layer_idx=-1``, drop the saved ``proj.*``
+    keys silently, and route eval through the never-trained ``cbl.fc`` head.
+    """
+    torch.save(cbl_model.state_dict(), cbl_path)
+    meta = {
+        "cbl_layer_idx": int(getattr(cbl_model, "cbl_layer_idx", -1)),
+        "use_residual": bool(getattr(cbl_model, "use_residual", True)),
+    }
+    with open(cbl_path + ".meta.json", "w") as f:
+        json.dump(meta, f)
 
 
 if __name__ == "__main__":
@@ -556,6 +612,20 @@ if __name__ == "__main__":
 
     set_seed(args.seed)
     debug_mode = bool(args.debug or args.debug_0_step)
+
+    # ── Bottleneck-mode sanity checks ─────────────────────────────────────────
+    # A1 reconstruction (drop residual when recon weight > 0) is incompatible
+    # with --add_llama_logits zero-init (which assumes the residual is on).
+    if args.cbl_layer_idx >= 0 and args.reconstruction_loss_weight > 0 and args.add_llama_logits:
+        raise ValueError(
+            "--reconstruction_loss_weight > 0 (drops the bottleneck residual) is "
+            "mutually exclusive with --add_llama_logits (which relies on the residual "
+            "for identity-at-init). Disable one of them in intermediate mode."
+        )
+    # In intermediate mode without recon, the residual is on; otherwise the
+    # bottleneck fully replaces h_L and the reconstruction loss must teach it
+    # to preserve h_L.
+    cbl_use_residual = not (args.cbl_layer_idx >= 0 and args.reconstruction_loss_weight > 0)
     hf_cache_root = str(Path(args.hf_cache_root).expanduser())
     Path(hf_cache_root).mkdir(parents=True, exist_ok=True)
     dataset_cache_dir = _resolve_cache_subdir(hf_cache_root, "datasets")
@@ -760,7 +830,9 @@ if __name__ == "__main__":
     opt_prelm = torch.optim.Adam(lora_layers, lr=5e-5)
 
     llama_vocab_weight = None
-    if args.add_llama_logits:
+    # Always load the lm_head weights when running in intermediate mode (we use them
+    # to project h_final → vocabs); otherwise only when --add_llama_logits is set.
+    if args.add_llama_logits or args.cbl_layer_idx >= 0:
         # IMPORTANT: For Llama-3, lm_head weights are not necessarily tied to input embeddings.
         # We therefore grab the *output* projection (lm_head) weights from a CausalLM head.
         # This does not add parameters to CBL; it's just an external tensor used in forward.
@@ -774,9 +846,15 @@ if __name__ == "__main__":
         del lm_head_model
 
     if args.discrimination_loss > 0:
-        cbl = CBL(config, len(concept_set), tokenizer).to(device)
+        cbl = CBL(
+            config, len(concept_set), tokenizer,
+            cbl_layer_idx=args.cbl_layer_idx, use_residual=cbl_use_residual,
+        ).to(device)
     else:
-        cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
+        cbl = CBLResidual(
+            config, len(concept_set), args.residual_dim, tokenizer,
+            cbl_layer_idx=args.cbl_layer_idx, use_residual=cbl_use_residual,
+        ).to(device)
     _zero_cbl_concept_and_unsup_branches_if_requested(cbl, args.add_llama_logits)
     opt_cbl = torch.optim.Adam(cbl.parameters(), lr=5e-5)
     print("preparing classifier")
@@ -831,6 +909,7 @@ if __name__ == "__main__":
             "orthogonal_loss": [],
             "residual_penalty_loss": [],
             "intervention_gen_loss": [],
+            "reconstruction_loss": [],
         }
 
     
@@ -858,9 +937,20 @@ if __name__ == "__main__":
                         f"[debug][train][epoch {e+1} step {i+1}] pre-preLM "
                         f"loss_mask={tuple(batch['loss_mask'].shape)}"
                     )
-            features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
-            llama_logits = F.linear(features, llama_vocab_weight) if llama_vocab_weight is not None else None
-            concepts, unsup, vocabs, matched_unsup = cbl(features.float(), llama_logits=llama_logits)
+            if args.cbl_layer_idx == -1:
+                features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
+                llama_logits = F.linear(features, llama_vocab_weight) if llama_vocab_weight is not None else None
+                concepts, unsup, vocabs, matched_unsup = cbl(features.float(), llama_logits=llama_logits)
+                h_L = h_L_proj = None
+            else:
+                concepts, unsup, vocabs, matched_unsup, h_L, h_L_proj = cbl.forward_full(
+                    preLM,
+                    batch["input_ids"],
+                    batch["attention_mask"],
+                    llama_vocab_weight=llama_vocab_weight,
+                )
+                llama_logits = None
+                features = None
             # print("concepts shape in training loop:", concepts.shape)
             # print("elastic_net_alphaunsup shape in training loop:", unsup.shape)
             # print("vocabs shape in training loop:", vocabs.shape)
@@ -889,19 +979,45 @@ if __name__ == "__main__":
                 raise ValueError(f"Unknown concept_loss_type: {args.concept_loss_type}")
             word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
             loss = args.concept_loss * concept_loss + word_loss*args.word_loss
-            reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
+            # In intermediate mode the concept→output mapping lives on `proj` (Linear(C+U, H));
+            # apply the same elastic-net penalty pattern to its concept slice.
+            if args.cbl_layer_idx == -1:
+                reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
+            else:
+                reg = elastic_net_penalty(cbl.proj.weight[:, :len(concept_set)])
         
             if matched_unsup is not None:
                 orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean().abs() ## TODO: check shape
                 loss += args.orthogonal_loss_weight * orthogonal_loss
                 training_losses["orthogonal_loss"].append(orthogonal_loss.detach().cpu().numpy())
         
-            if args.residual_penalty_weight > 0:
+            if args.residual_penalty_weight > 0 and args.cbl_layer_idx == -1:
                 residual_contrib = cbl.compute_residual_contrib(unsup)
                 residual_penalty = torch.mean(torch.abs(residual_contrib)) ## TODO: check logic
                 loss += args.residual_penalty_weight * residual_penalty
                 training_losses["residual_penalty_loss"].append(residual_penalty.detach().cpu().numpy())
-            
+            elif args.residual_penalty_weight > 0 and args.cbl_layer_idx >= 0 and i == 0 and e == 0:
+                print("[warn] --residual_penalty_weight > 0 is ignored in intermediate mode (cbl_layer_idx >= 0).")
+
+            # Reconstruction loss (intermediate mode only): MSE(h_L_proj, h_L) with the same
+            # assistant-only loss_mask as concept/word losses. Recon is per-position
+            # (not shifted), so the shifted loss_mask must be left-padded with 0 to
+            # convert "target at i+1 is assistant" → "current pos p is assistant".
+            if args.cbl_layer_idx >= 0 and args.reconstruction_loss_weight > 0:
+                recon_target = h_L.detach().to(h_L_proj.dtype)
+                recon_diff = (h_L_proj - recon_target) ** 2
+                recon_mask = batch["attention_mask"].bool()
+                if (not args.skip_loss_mask) and ("loss_mask" in batch):
+                    lm_full = F.pad(batch["loss_mask"], (1, 0), value=0).bool()
+                    recon_mask = recon_mask & lm_full
+                recon_mask_f = recon_mask.unsqueeze(-1).to(recon_diff.dtype)
+                recon_denom = recon_mask_f.sum().clamp_min(1.0) * recon_diff.shape[-1]
+                reconstruction_loss = (recon_diff * recon_mask_f).sum() / recon_denom
+                loss += args.reconstruction_loss_weight * reconstruction_loss
+                training_losses.setdefault("reconstruction_loss", []).append(
+                    reconstruction_loss.detach().cpu().numpy()
+                )
+
             if args.intervention_gen_loss > 0:
                 ### concepts shapes: (B, seq_len, concept_dim)
                 intervention_value = get_intervention_value(DATASET)
@@ -914,14 +1030,25 @@ if __name__ == "__main__":
                 )
                 
                 # print("intervened_concept shape: ", intervened_concept.shape, intervened_concept.max(), intervened_concept.min())
-                llama_logits_for_intervene = None
-                if llama_logits is not None:
-                    llama_logits_for_intervene = llama_logits if args.no_detach_intervention else llama_logits.detach()
-
-                if args.no_detach_intervention:
-                    vocab = cbl.intervene(unsup, intervened_concept.detach(), llama_logits=llama_logits_for_intervene)
+                if args.cbl_layer_idx == -1:
+                    llama_logits_for_intervene = None
+                    if llama_logits is not None:
+                        llama_logits_for_intervene = llama_logits if args.no_detach_intervention else llama_logits.detach()
+                    if args.no_detach_intervention:
+                        vocab = cbl.intervene(unsup, intervened_concept.detach(), llama_logits=llama_logits_for_intervene)
+                    else:
+                        vocab = cbl.intervene(unsup.detach(), intervened_concept.detach(), llama_logits=llama_logits_for_intervene)
                 else:
-                    vocab = cbl.intervene(unsup.detach(), intervened_concept.detach(), llama_logits=llama_logits_for_intervene)
+                    # Tail-only re-forward through layers[L+1:] + norm + lm_head.
+                    unsup_for_intervene = unsup if args.no_detach_intervention else unsup.detach()
+                    vocab = cbl.intervene_full(
+                        preLM,
+                        h_L.detach(),
+                        batch["attention_mask"],
+                        intervened_concept.detach(),
+                        unsup_for_intervene,
+                        llama_vocab_weight,
+                    )
                 intervention_gen_loss = torch.nn.CrossEntropyLoss()(vocab[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
                 loss += args.intervention_gen_loss * intervention_gen_loss
                 training_losses["intervention_gen_loss"].append(intervention_gen_loss.detach().cpu().numpy())
@@ -953,7 +1080,11 @@ if __name__ == "__main__":
                 opt_classifier.step()
 
             if args.neg_entropy_loss > 0:
-                _, unsup, _, _ = cbl(features.detach().float())
+                if args.cbl_layer_idx == -1:
+                    _, unsup, _, _ = cbl(features.detach().float())
+                else:
+                    # Intermediate mode: re-derive unsup from cached h_L without rerunning preLM.
+                    unsup = cbl._unsup_branch(h_L.detach().float())
                 classification = classifier(mean_pooling(unsup, batch["attention_mask"]))
                 p = F.softmax(classification, dim=-1)
                 neg_entropy_loss = torch.sum(p * torch.log(p), dim=-1).mean()
@@ -998,7 +1129,11 @@ if __name__ == "__main__":
                 word_label,
                 batch,
                 batch_sim,
+                h_L,
+                h_L_proj,
             )
+            if "reconstruction_loss" in locals():
+                del reconstruction_loss
             if "classification" in locals():
                 del classification
             if "discrimination_loss" in locals():
@@ -1047,20 +1182,34 @@ if __name__ == "__main__":
             "orthogonal_loss": [],
             "residual_penalty_loss": [],
             "intervention_gen_loss": [],
+            "reconstruction_loss": [],
             "total_loss": [],
         }
         with torch.no_grad():
             for batch, batch_sim in tqdm(valid_loader, total=len(valid_loader), desc=f"valid/epoch_{e+1}"):
                 batch = {k: v.to(device) for k, v in batch.items()}
                 batch_sim = batch_sim.to(device)
-                val_features = preLM(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                ).last_hidden_state
-                val_llama_logits = F.linear(val_features, llama_vocab_weight) if llama_vocab_weight is not None else None
-                val_concepts, val_unsup, val_vocabs, val_matched_unsup = cbl(
-                    val_features.float(), llama_logits=val_llama_logits
-                )
+                if args.cbl_layer_idx == -1:
+                    val_features = preLM(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                    ).last_hidden_state
+                    val_llama_logits = F.linear(val_features, llama_vocab_weight) if llama_vocab_weight is not None else None
+                    val_concepts, val_unsup, val_vocabs, val_matched_unsup = cbl(
+                        val_features.float(), llama_logits=val_llama_logits
+                    )
+                    val_h_L = val_h_L_proj = None
+                else:
+                    val_concepts, val_unsup, val_vocabs, val_matched_unsup, val_h_L, val_h_L_proj = (
+                        cbl.forward_full(
+                            preLM,
+                            batch["input_ids"],
+                            batch["attention_mask"],
+                            llama_vocab_weight=llama_vocab_weight,
+                        )
+                    )
+                    val_features = None
+                    val_llama_logits = None
                 pooled_val_concepts = eos_pooling(val_concepts, batch["attention_mask"])
                 val_preds.append(pooled_val_concepts.detach().cpu())
                 val_targets.append(batch_sim.detach().cpu())
@@ -1097,7 +1246,10 @@ if __name__ == "__main__":
                     val_vocabs[:, :-1, :].reshape(-1, config.vocab_size),
                     val_word_label.reshape(-1),
                 )
-                val_reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
+                if args.cbl_layer_idx == -1:
+                    val_reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
+                else:
+                    val_reg = elastic_net_penalty(cbl.proj.weight[:, :len(concept_set)])
 
                 val_orthogonal_loss = torch.zeros((), device=device)
                 if val_matched_unsup is not None:
@@ -1106,9 +1258,23 @@ if __name__ == "__main__":
                     ).mean().abs()
 
                 val_residual_penalty = torch.zeros((), device=device)
-                if args.residual_penalty_weight > 0:
+                if args.residual_penalty_weight > 0 and args.cbl_layer_idx == -1:
                     val_residual_contrib = cbl.compute_residual_contrib(val_unsup)
                     val_residual_penalty = torch.mean(torch.abs(val_residual_contrib))
+
+                val_reconstruction_loss = torch.zeros((), device=device)
+                if args.cbl_layer_idx >= 0 and args.reconstruction_loss_weight > 0:
+                    val_recon_target = val_h_L.detach().to(val_h_L_proj.dtype)
+                    val_recon_diff = (val_h_L_proj - val_recon_target) ** 2
+                    val_recon_mask = batch["attention_mask"].bool()
+                    if (not args.skip_loss_mask) and ("loss_mask" in batch):
+                        # See training-loop comment: pad LEFT to realign shifted loss_mask
+                        # to current-position (p ↔ loss_mask[p-1]).
+                        val_lm_full = F.pad(batch["loss_mask"], (1, 0), value=0).bool()
+                        val_recon_mask = val_recon_mask & val_lm_full
+                    val_recon_mask_f = val_recon_mask.unsqueeze(-1).to(val_recon_diff.dtype)
+                    val_recon_denom = val_recon_mask_f.sum().clamp_min(1.0) * val_recon_diff.shape[-1]
+                    val_reconstruction_loss = (val_recon_diff * val_recon_mask_f).sum() / val_recon_denom
 
                 val_intervention_gen_loss = torch.zeros((), device=device)
                 if args.intervention_gen_loss > 0:
@@ -1118,11 +1284,21 @@ if __name__ == "__main__":
                         intervention_value=intervention_value,
                         keep_other_concepts=args.intervention_keep_other_concepts,
                     )
-                    val_intervene_vocab = cbl.intervene(
-                        val_unsup.detach(),
-                        val_intervened_concept.detach(),
-                        llama_logits=val_llama_logits.detach() if val_llama_logits is not None else None,
-                    )
+                    if args.cbl_layer_idx == -1:
+                        val_intervene_vocab = cbl.intervene(
+                            val_unsup.detach(),
+                            val_intervened_concept.detach(),
+                            llama_logits=val_llama_logits.detach() if val_llama_logits is not None else None,
+                        )
+                    else:
+                        val_intervene_vocab = cbl.intervene_full(
+                            preLM,
+                            val_h_L.detach(),
+                            batch["attention_mask"],
+                            val_intervened_concept.detach(),
+                            val_unsup.detach(),
+                            llama_vocab_weight,
+                        )
                     val_intervention_gen_loss = torch.nn.CrossEntropyLoss()(
                         val_intervene_vocab[:, :-1, :].reshape(-1, config.vocab_size),
                         val_word_label.reshape(-1),
@@ -1135,6 +1311,7 @@ if __name__ == "__main__":
                     + args.orthogonal_loss_weight * val_orthogonal_loss
                     + args.residual_penalty_weight * val_residual_penalty
                     + args.intervention_gen_loss * val_intervention_gen_loss
+                    + args.reconstruction_loss_weight * val_reconstruction_loss
                 )
 
                 val_losses["concept_loss"].append(float(val_concept_loss.detach().cpu().item()))
@@ -1143,6 +1320,7 @@ if __name__ == "__main__":
                 val_losses["orthogonal_loss"].append(float(val_orthogonal_loss.detach().cpu().item()))
                 val_losses["residual_penalty_loss"].append(float(val_residual_penalty.detach().cpu().item()))
                 val_losses["intervention_gen_loss"].append(float(val_intervention_gen_loss.detach().cpu().item()))
+                val_losses["reconstruction_loss"].append(float(val_reconstruction_loss.detach().cpu().item()))
                 val_losses["total_loss"].append(float(val_total_loss.detach().cpu().item()))
 
                 del (
@@ -1162,6 +1340,9 @@ if __name__ == "__main__":
                     val_orthogonal_loss,
                     val_residual_penalty,
                     val_intervention_gen_loss,
+                    val_reconstruction_loss,
+                    val_h_L,
+                    val_h_L_proj,
                     val_word_label,
                     batch,
                     batch_sim,
@@ -1200,7 +1381,7 @@ if __name__ == "__main__":
                 ),
                 "epoch": e + 1,
             }
-            for loss_key in ("concept_loss", "word_loss", "reg_loss", "orthogonal_loss", "residual_penalty_loss", "intervention_gen_loss"):
+            for loss_key in ("concept_loss", "word_loss", "reg_loss", "orthogonal_loss", "residual_penalty_loss", "intervention_gen_loss", "reconstruction_loss"):
                 if len(val_losses[loss_key]) > 0:
                     val_log[f"valid_{loss_key}"] = sum(val_losses[loss_key]) / len(val_losses[loss_key])
             print(
@@ -1228,19 +1409,20 @@ if __name__ == "__main__":
             + args.orthogonal_loss_weight * float(avg_metrics.get("orthogonal_loss", 0.0))
             + args.residual_penalty_weight * float(avg_metrics.get("residual_penalty_loss", 0.0))
             + args.intervention_gen_loss * float(avg_metrics.get("intervention_gen_loss", 0.0))
+            + args.reconstruction_loss_weight * float(avg_metrics.get("reconstruction_loss", 0.0))
         )
         wandb_log({"avg_total_loss": avg_total_loss})
 
         print("save model")
         preLM.save_pretrained(prefix + model_name + "_epoch_" + str(e + 1))
-        torch.save(cbl.state_dict(), prefix + cbl_name + "_epoch_" + str(e + 1) + ".pt")
+        _save_cbl_with_meta(cbl, prefix + cbl_name + "_epoch_" + str(e + 1) + ".pt")
 
         score_for_best = float(avg_metrics.get("valid_loss", float("inf")))
         if score_for_best < best_loss:
             best_loss = score_for_best
             best_epoch = e + 1
             preLM.save_pretrained(prefix + model_name + "_best")
-            torch.save(cbl.state_dict(), prefix + cbl_name + "_best.pt")
+            _save_cbl_with_meta(cbl, prefix + cbl_name + "_best.pt")
             print(f"New best checkpoint at epoch {best_epoch} (valid_loss={best_loss:.6f})")
             wandb_log({"best_epoch": best_epoch, "best_valid_loss": best_loss})
 
@@ -1250,9 +1432,9 @@ if __name__ == "__main__":
         best_epoch = 0
         print("No training epochs requested; saving initial adapter and CBL as epoch_0 and best.")
         preLM.save_pretrained(prefix + model_name + "_epoch_0")
-        torch.save(cbl.state_dict(), prefix + cbl_name + "_epoch_0.pt")
+        _save_cbl_with_meta(cbl, prefix + cbl_name + "_epoch_0.pt")
         preLM.save_pretrained(prefix + model_name + "_best")
-        torch.save(cbl.state_dict(), prefix + cbl_name + "_best.pt")
+        _save_cbl_with_meta(cbl, prefix + cbl_name + "_best.pt")
         wandb_log({"best_epoch": best_epoch})
 
     end = time.time()
@@ -1287,14 +1469,20 @@ if __name__ == "__main__":
     preLM.eval()
 
     llama_vocab_weight = None
-    if args.add_llama_logits:
+    if args.add_llama_logits or args.cbl_layer_idx >= 0:
         from eval_metrics import get_llama_vocab_weight
         llama_vocab_weight = get_llama_vocab_weight(device)
 
     if args.discrimination_loss > 0:
-        cbl = CBL(config, len(concept_set), tokenizer).to(device)
+        cbl = CBL(
+            config, len(concept_set), tokenizer,
+            cbl_layer_idx=args.cbl_layer_idx, use_residual=cbl_use_residual,
+        ).to(device)
     else:
-        cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
+        cbl = CBLResidual(
+            config, len(concept_set), args.residual_dim, tokenizer,
+            cbl_layer_idx=args.cbl_layer_idx, use_residual=cbl_use_residual,
+        ).to(device)
     best_cbl_path = prefix + cbl_name + "_best.pt"
     if os.path.isfile(best_cbl_path):
         cbl_state_path = best_cbl_path

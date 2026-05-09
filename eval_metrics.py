@@ -542,14 +542,22 @@ def run_codecontests_testset_evaluation_for_cbm(
             prompt = _format_code_generation_prompt(tokenizer, description, language="python")
             eval_enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
             with torch.no_grad():
-                eval_features = preLM(
-                    input_ids=eval_enc["input_ids"],
-                    attention_mask=eval_enc["attention_mask"],
-                ).last_hidden_state
-                eval_llama_logits = (
-                    F.linear(eval_features, llama_vocab_weight) if llama_vocab_weight is not None else None
-                )
-                eval_concepts, _, _, _ = cbl(eval_features.float(), llama_logits=eval_llama_logits)
+                if getattr(cbl, "cbl_layer_idx", -1) == -1:
+                    eval_features = preLM(
+                        input_ids=eval_enc["input_ids"],
+                        attention_mask=eval_enc["attention_mask"],
+                    ).last_hidden_state
+                    eval_llama_logits = (
+                        F.linear(eval_features, llama_vocab_weight) if llama_vocab_weight is not None else None
+                    )
+                    eval_concepts, _, _, _ = cbl(eval_features.float(), llama_logits=eval_llama_logits)
+                else:
+                    eval_concepts, _, _, _, _, _ = cbl.forward_full(
+                        preLM,
+                        eval_enc["input_ids"],
+                        eval_enc["attention_mask"],
+                        llama_vocab_weight=llama_vocab_weight,
+                    )
                 pooled_eval_concepts = eos_pooling(eval_concepts, eval_enc["attention_mask"]).squeeze(0).detach().cpu()
 
             target_multihot = torch.zeros(len(concept_set), dtype=torch.float32)
@@ -1077,34 +1085,82 @@ def find_eval_checkpoint(prefix, run_type, dataset):
 # Model Loading
 # ═══════════════════════════════════════════════════════════════
 
+def _read_cbl_meta(cbl_path: str) -> dict:
+    """Read the sidecar ``<cbl_path>.meta.json`` written by training.
+
+    Returns ``{"cbl_layer_idx": int, "use_residual": bool}``. If the sidecar
+    does not exist (legacy last-layer-mode checkpoint), returns the defaults
+    ``{"cbl_layer_idx": -1, "use_residual": True}`` which exactly matches the
+    pre-intermediate-mode behavior.
+    """
+    meta_path = cbl_path + ".meta.json"
+    if not os.path.isfile(meta_path):
+        return {"cbl_layer_idx": -1, "use_residual": True}
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+    return {
+        "cbl_layer_idx": int(meta.get("cbl_layer_idx", -1)),
+        "use_residual": bool(meta.get("use_residual", True)),
+    }
+
+
 def load_model_and_cbl(
     peft_path, cbl_path, config, concept_set, tokenizer,
     discrimination_loss, residual_dim, device,
 ):
+    """Load preLM + CBL using sidecar mode metadata.
+
+    Reads ``<cbl_path>.meta.json`` to recover ``cbl_layer_idx`` and
+    ``use_residual`` so the constructed module's shape matches the checkpoint
+    (the ``proj`` layer is allocated iff intermediate mode). Loading is then
+    performed with ``strict=True`` so any future drift fails loudly instead of
+    silently dropping ``proj.*`` and routing eval through the never-trained
+    ``cbl.fc`` head.
+
+    When the checkpoint is in intermediate mode (``cbl_layer_idx >= 0``) the
+    ``llama_vocab_weight`` is required for any forward through ``forward_full``
+    or the bottleneck generation paths; we eagerly load it here and return it
+    as the third tuple element.
+
+    Returns ``(preLM, cbl, llama_vocab_weight)``. ``llama_vocab_weight`` is
+    ``None`` for last-layer-mode checkpoints (callers can still pass their own
+    if ``--add_llama_logits`` was used at train time).
+    """
     preLM = LlamaModel.from_pretrained(
         LCB_LLAMA3_INSTRUCT_MODEL_ID, torch_dtype=torch.bfloat16,
     ).to(device)
     preLM.load_adapter(peft_path)
     preLM.eval()
 
+    meta = _read_cbl_meta(cbl_path)
+    cbl_layer_idx = meta["cbl_layer_idx"]
+    use_residual = meta["use_residual"]
+    print(
+        f"[load_model_and_cbl] {cbl_path}: "
+        f"cbl_layer_idx={cbl_layer_idx}, use_residual={use_residual} "
+        f"(from {'sidecar' if os.path.isfile(cbl_path + '.meta.json') else 'defaults'})"
+    )
+
     if discrimination_loss > 0:
-        cbl = CBL(config, len(concept_set), tokenizer).to(device)
+        cbl = CBL(
+            config, len(concept_set), tokenizer,
+            cbl_layer_idx=cbl_layer_idx, use_residual=use_residual,
+        ).to(device)
     else:
-        cbl = CBLResidual(config, len(concept_set), residual_dim, tokenizer).to(device)
+        cbl = CBLResidual(
+            config, len(concept_set), residual_dim, tokenizer,
+            cbl_layer_idx=cbl_layer_idx, use_residual=use_residual,
+        ).to(device)
 
     state_dict = torch.load(cbl_path, map_location=device)
-    try:
-        cbl.load_state_dict(state_dict, strict=True)
-    except RuntimeError as e:
-        print(f"Warning: strict load_state_dict failed for {cbl_path}: {e}")
-        incompatible = cbl.load_state_dict(state_dict, strict=False)
-        print(
-            f"Falling back to strict=False: "
-            f"missing={len(incompatible.missing_keys)} "
-            f"unexpected={len(incompatible.unexpected_keys)}"
-        )
+    cbl.load_state_dict(state_dict, strict=True)
     cbl.eval()
-    return preLM, cbl
+
+    llama_vocab_weight = None
+    if cbl_layer_idx >= 0:
+        llama_vocab_weight = get_llama_vocab_weight(device)
+
+    return preLM, cbl, llama_vocab_weight
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1425,14 +1481,22 @@ def run_concept_accuracy_cosine(
     for batch, _ in tqdm(test_loader, total=len(test_loader)):
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
-            features = preLM(
-                input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
-            ).last_hidden_state
-            llama_logits = F.linear(features, llama_vocab_weight) if llama_vocab_weight is not None else None
-            if llama_logits is not None:
-                concepts, _, _, _ = cbl(features.float(), llama_logits=llama_logits)
+            if getattr(cbl, "cbl_layer_idx", -1) == -1:
+                features = preLM(
+                    input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+                ).last_hidden_state
+                llama_logits = F.linear(features, llama_vocab_weight) if llama_vocab_weight is not None else None
+                if llama_logits is not None:
+                    concepts, _, _, _ = cbl(features.float(), llama_logits=llama_logits)
+                else:
+                    concepts, _, _, _ = cbl(features.float())
             else:
-                concepts, _, _, _ = cbl(features.float())
+                concepts, _, _, _, _, _ = cbl.forward_full(
+                    preLM,
+                    batch["input_ids"],
+                    batch["attention_mask"],
+                    llama_vocab_weight=llama_vocab_weight,
+                )
         pooled_concepts = eos_pooling(concepts, batch["attention_mask"])
         concept_predictions.append(pooled_concepts.detach().cpu())
     concept_predictions = torch.cat(concept_predictions, dim=0)
@@ -1509,21 +1573,33 @@ def run_concept_accuracy_cosine(
 # ═══════════════════════════════════════════════════════════════
 
 def run_weight_analysis(cbl, concept_set, tokenizer):
-    """Print and log top tokens per concept neuron and sparsity."""
-    print("Top tokens for each concept neuron:")
-    w = cbl.fc.weight.data[:, : len(concept_set)].T
-    for i in tqdm(range(len(concept_set))):
-        top_values, top_ids = torch.topk(w[i], k=10)
-        print(f"Neuron: {concept_set[i]}")
-        print("Top 10 tokens with highest weight:")
-        for j in range(10):
-            print(
-                f"Neuron: {concept_set[i]} "
-                f"[{round(float(top_values.detach().cpu()[j]), 3)}] "
-                f"{tokenizer.decode(top_ids[j])}"
-            )
+    """Print and log top tokens per concept neuron and sparsity.
 
-    sparsity = (w > 1e-6).count_nonzero() / w.numel()
+    Last-layer mode: top *vocab tokens* per concept (rows of ``cbl.fc``).
+    Intermediate mode: ``cbl.fc`` is unused for the model output; the analogous
+    artifact is ``cbl.proj`` (Linear(C+U, hidden_size)). Reporting top *hidden-state
+    dimensions* there isn't decodable as tokens, so we just log sparsity in that
+    case (still on the concept slice of the projection weight).
+    """
+    if getattr(cbl, "cbl_layer_idx", -1) == -1:
+        print("Top tokens for each concept neuron:")
+        w = cbl.fc.weight.data[:, : len(concept_set)].T
+        for i in tqdm(range(len(concept_set))):
+            top_values, top_ids = torch.topk(w[i], k=10)
+            print(f"Neuron: {concept_set[i]}")
+            print("Top 10 tokens with highest weight:")
+            for j in range(10):
+                print(
+                    f"Neuron: {concept_set[i]} "
+                    f"[{round(float(top_values.detach().cpu()[j]), 3)}] "
+                    f"{tokenizer.decode(top_ids[j])}"
+                )
+        sparsity = (w > 1e-6).count_nonzero() / w.numel()
+    else:
+        print("[weight-analysis] cbl_layer_idx >= 0: skipping top-token listing "
+              "(proj outputs hidden dims, not vocab); reporting sparsity only.")
+        w = cbl.proj.weight.data[:, : len(concept_set)].T
+        sparsity = (w > 1e-6).count_nonzero() / w.numel()
     print(f"Sparsity of concept weight matrix: {sparsity}")
     safe_wandb_log({"concept_weight_sparsity": sparsity})
 
