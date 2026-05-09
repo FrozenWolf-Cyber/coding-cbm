@@ -27,7 +27,6 @@ from utils import (
 from eval_metrics import (
     _format_host_memory_stats,
     set_seed,
-    get_intervention_value,
     run_concept_accuracy_cosine,
     run_weight_analysis,
     compute_perplexity,
@@ -363,7 +362,12 @@ parser.add_argument(
     default="none,groundtruth",
     help="Comma-separated list of steering modes to evaluate: none,groundtruth.",
 )
-# Intervention value for LCB steering is taken from get_intervention_value(DATASET).
+parser.add_argument(
+    "--intervention_value",
+    type=int,
+    default=150,
+    help="Magnitude applied to steered concepts (intervention-gen loss validation/train and LCB/code_contests eval).",
+)
 # LCB generation params — defaults match the leaderboard so numbers are comparable.
 parser.add_argument(
     "--lcb_n_samples",
@@ -873,8 +877,7 @@ if __name__ == "__main__":
         opt_classifier = torch.optim.Adam(classifier.parameters(), lr=1e-3)
 
 
-    intervention_value = get_intervention_value(DATASET)
-
+    intervention_value = args.intervention_value
 
     print("start training...")
     best_loss = float('inf')
@@ -1020,8 +1023,6 @@ if __name__ == "__main__":
 
             if args.intervention_gen_loss > 0:
                 ### concepts shapes: (B, seq_len, concept_dim)
-                intervention_value = get_intervention_value(DATASET)
-
                 intervened_concept = build_intervened_concepts_from_similarity(
                     concepts=concepts,
                     batch_sim=batch_sim,
@@ -1493,7 +1494,6 @@ if __name__ == "__main__":
     cbl.eval()
 
     # ── Configure evaluation ──
-    intervention_value = get_intervention_value(DATASET)
     set_seed(args.seed)
 
     # ── Concept accuracy ──
@@ -1541,7 +1541,7 @@ if __name__ == "__main__":
 
         lcb_steer_modes = [m.strip() for m in args.lcb_steer_modes.split(",") if m.strip()]
 
-        steer_value = get_intervention_value(DATASET)
+        steer_value = args.intervention_value
         print(f"Running code generation eval (steer_modes={lcb_steer_modes}) ...", flush=True)
 
         print("[pre-code-eval] Running code_contests test-set generation + metrics ...", flush=True)

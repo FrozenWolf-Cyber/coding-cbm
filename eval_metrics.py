@@ -129,8 +129,9 @@ def release_llama_vocab_weight():
             pass
 
 
-def get_intervention_value(dataset: str) -> int:
-    return 150
+# Default steering magnitude when callers pass `steer_value=None` (matches
+# `train_combined_finegrained.py --intervention_value` default).
+DEFAULT_INTERVENTION_VALUE = 150
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -414,7 +415,7 @@ def run_codecontests_testset_evaluation_for_cbm(
         run_id = wandb.run.id if wandb.run is not None else "norun"
 
     if steer_value is None:
-        steer_value = float(get_intervention_value("code_contests"))
+        steer_value = float(DEFAULT_INTERVENTION_VALUE)
 
     if steer_modes is None:
         steer_modes = ["none"]
@@ -715,7 +716,7 @@ def run_livecodebench_benchmark_generation_for_cbm(
         run_id = wandb.run.id if wandb.run is not None else "norun"
 
     if steer_value is None:
-        steer_value = float(get_intervention_value("code_contests"))
+        steer_value = float(DEFAULT_INTERVENTION_VALUE)
     if steer_modes is None:
         steer_modes = ["none"]
 
