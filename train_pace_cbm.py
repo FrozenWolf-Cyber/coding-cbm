@@ -149,6 +149,11 @@ def parse_args():
             "(recomputes attention; very slow). Optional ablation / debug."
         ),
     )
+    parser.add_argument(
+        "--eval_debug",
+        action="store_true",
+        help="Verbose post-training eval logs (shapes, timings); see pace.eval_steerable._eval_debug.",
+    )
     parser.add_argument("--compute_dtype", type=str, default="float32",
                         choices=["float32", "bfloat16", "float16"])
 
@@ -450,6 +455,7 @@ def main():
         cf_size=pace_cbm.cf_size,
         device=device,
         test_similarity_np=test_similarity,
+        eval_debug=bool(args.eval_debug),
     )
 
     steer_modes = [m.strip() for m in args.steer_modes.split(",") if m.strip()]
@@ -493,6 +499,7 @@ def main():
         cf_offset=pace_cbm.cf_offset,
         cf_size=pace_cbm.cf_size,
         generate_use_cache=generate_use_cache,
+        eval_debug=bool(args.eval_debug),
     )
 
     cc_generations_by_mode = {}
@@ -524,6 +531,7 @@ def main():
         extracted_preview_chars=args.extracted_preview_chars,
         eval_log_host_memory=bool(debug_mode or args.eval_log_host_memory),
         generate_use_cache=generate_use_cache,
+        eval_debug=bool(args.eval_debug),
     )
 
     # Free LM + PaCE-CBM before loading downstream evaluators.

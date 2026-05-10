@@ -48,6 +48,18 @@ from .intervention import (
 )
 
 
+def _eval_debug(enabled: bool, stage: str, message: str = "", **info: Any) -> None:
+    """Structured stdout for ``--eval_debug`` (shapes, timings, stages)."""
+    if not enabled:
+        return
+    parts = [f"[eval-debug] {stage}"]
+    if message:
+        parts.append(message)
+    for k, v in info.items():
+        parts.append(f"{k}={v}")
+    print(" | ".join(parts), flush=True)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Concept-accuracy (PaCE-CBM only — vector steerers don't expose c_sparse)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -63,6 +75,7 @@ def run_concept_accuracy_pace(
     cf_size: int,
     device: torch.device,
     test_similarity_np,
+    eval_debug: bool = False,
 ) -> Dict[str, float]:
     """EOS-pooled c_sparse[CF block] vs ground-truth multi-hot, top-k metrics."""
     print("eval concepts (PaCE-CBM cosine similarity)...")
@@ -72,11 +85,33 @@ def run_concept_accuracy_pace(
     steerer = PaCECBMSteerer(pace_cbm)
     pred_chunks: list[Tensor] = []
     steerer.attach(llm)
+    t_concept = time.perf_counter()
+    _eval_debug(
+        eval_debug,
+        "concept_acc/start",
+        n_batches=len(test_loader),
+        device=str(device),
+    )
     with steerer:
         steerer.configure_for_batch(cf_multihot=None)  # no intervention
-        for batch, _ in tqdm(test_loader, total=len(test_loader), desc="concept-acc"):
+        for bi, (batch, _) in enumerate(tqdm(test_loader, total=len(test_loader), desc="concept-acc")):
             batch = {k: v.to(device) for k, v in batch.items()}
+            if eval_debug and bi == 0:
+                _eval_debug(
+                    eval_debug,
+                    "concept_acc/first_batch",
+                    input_ids=tuple(batch["input_ids"].shape),
+                    attention_mask=tuple(batch["attention_mask"].shape),
+                )
+            t_step = time.perf_counter()
             llm(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+            if eval_debug and bi == 0:
+                _eval_debug(
+                    eval_debug,
+                    "concept_acc/first_forward",
+                    forward_s=_fmt_seconds(time.perf_counter() - t_step),
+                    c_sparse=tuple(steerer.last_c_sparse.shape),
+                )
             c_sparse = steerer.last_c_sparse  # (B, T, C_total)
             c_sparse_cf = c_sparse[:, :, cf_offset:cf_offset + cf_size]  # (B, T, C_cf)
             pooled = eos_pooling(c_sparse_cf, batch["attention_mask"]).detach().cpu()  # (B, C_cf)
@@ -109,6 +144,12 @@ def run_concept_accuracy_pace(
         f"top10={payload['test_concept_top10_acc']:.4f} "
         f"cos={payload['test_concept_cosine_raw']:.4f}"
     )
+    _eval_debug(
+        eval_debug,
+        "concept_acc/done",
+        total_s=_fmt_seconds(time.perf_counter() - t_concept),
+        pred_shape=tuple(pred.shape),
+    )
     safe_wandb_log(payload)
     return payload
 
@@ -136,6 +177,7 @@ def _generate_with_steerer_batched(
     zero_other_concepts: bool,
     device: torch.device,
     use_cache: bool = True,
+    eval_debug: bool = False,
 ) -> List[List[str]]:
     """Tokenize, repeat-interleave for n_samples, configure steerer, run
     ``llm.generate(...)`` with the hook attached, decode.
@@ -147,6 +189,7 @@ def _generate_with_steerer_batched(
     if not prompts:
         return []
 
+    t_all = time.perf_counter()
     original_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     enc = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
@@ -155,17 +198,49 @@ def _generate_with_steerer_batched(
     input_ids = enc["input_ids"]  # (B_prompt, T_pad) left-padded to max prompt len in batch
     attention_mask = enc["attention_mask"]  # (B_prompt, T_pad)
     prompt_width = input_ids.shape[1]  # T_pad — slice completions from here onward
+    _eval_debug(
+        eval_debug,
+        "generate/tokenize",
+        n_prompts=len(prompts),
+        input_ids=tuple(input_ids.shape),
+        attention_mask=tuple(attention_mask.shape),
+        prompt_width=prompt_width,
+        n_samples=n_samples,
+        steerer=type(steerer).__name__,
+        use_cache=use_cache,
+    )
+    if hasattr(steerer, "steer_vecs"):
+        _eval_debug(
+            eval_debug,
+            "generate/vec_steerer",
+            steer_vecs=tuple(steerer.steer_vecs.shape),
+            method_name=getattr(steerer, "method_name", "?"),
+            layer_idx=getattr(steerer, "layer_idx", "?"),
+        )
 
     if n_samples > 1:
         # Expand batch for num_return_sequences: (B_prompt, T) -> (B_prompt*n_samples, T)
         input_ids = input_ids.repeat_interleave(n_samples, dim=0)
         attention_mask = attention_mask.repeat_interleave(n_samples, dim=0)
+        _eval_debug(
+            eval_debug,
+            "generate/after_repeat_interleave",
+            input_ids=tuple(input_ids.shape),
+            attention_mask=tuple(attention_mask.shape),
+        )
 
     # Stage payload at the original B granularity, then expand for n_samples.
     if not isinstance(steerer, NoSteer):
         cf_multihot = None
         if cf_tags_per_prompt is not None:
             cf_multihot = cf_tags_to_multihot(cf_tags_per_prompt, cf_concepts).to(device)
+        _eval_debug(
+            eval_debug,
+            "generate/before_configure",
+            alpha=alpha,
+            zero_other_concepts=zero_other_concepts,
+            cf_multihot=tuple(cf_multihot.shape) if cf_multihot is not None else None,
+        )
         configure_steerer(
             steerer,
             cf_multihot=cf_multihot,
@@ -175,9 +250,19 @@ def _generate_with_steerer_batched(
             device=device,
         )
         expand_payload_for_n_samples(steerer, n_samples)
+        payload = getattr(steerer, "_payload", None)
+        if eval_debug and isinstance(payload, dict):
+            av = payload.get("add_vec")
+            _eval_debug(
+                eval_debug,
+                "generate/after_configure",
+                payload_keys=list(payload.keys()),
+                add_vec_shape=tuple(av.shape) if isinstance(av, Tensor) else None,
+            )
 
     steerer.attach(llm)
     with steerer:
+        t_gen = time.perf_counter()
         gen_ids = llm.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -190,6 +275,14 @@ def _generate_with_steerer_batched(
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
             use_cache=use_cache,
         )  # (B_total, T_pad + T_new); B_total = B_prompt * n_samples
+        _eval_debug(
+            eval_debug,
+            "generate/llm.generate",
+            elapsed_s=_fmt_seconds(time.perf_counter() - t_gen),
+            gen_ids=tuple(gen_ids.shape),
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+        )
 
     num_prompts = len(prompts)
     outputs: List[List[str]] = []
@@ -200,6 +293,12 @@ def _generate_with_steerer_batched(
             completion = gen_ids[base + s, prompt_width:]  # (T_new,)
             rows.append(tokenizer.decode(completion, skip_special_tokens=True).strip())
         outputs.append(rows)
+    _eval_debug(
+        eval_debug,
+        "generate/done",
+        total_wall_s=_fmt_seconds(time.perf_counter() - t_all),
+        num_prompts=num_prompts,
+    )
     return outputs
 
 
@@ -267,6 +366,7 @@ def run_codecontests_testset_eval_steerable(
     cf_offset: int = 0,
     cf_size: Optional[int] = None,
     generate_use_cache: bool = True,
+    eval_debug: bool = False,
 ) -> dict:
     """Mirror of ``eval_metrics.run_codecontests_testset_evaluation_for_cbm``
     but parameterised on ``steerer_factory`` (a callable returning a fresh
@@ -313,6 +413,17 @@ def run_codecontests_testset_eval_steerable(
     if cc_td is None:
         return {}
 
+    _eval_debug(
+        eval_debug,
+        "code_contests/init",
+        n_rows=len(cc_td),
+        steer_modes=steer_modes,
+        batch_size=batch_size,
+        model_label=model_label,
+        layer_idx=layer_idx,
+        generate_use_cache=generate_use_cache,
+        device=str(device),
+    )
     print(f"\n{'='*60}\n code_contests test set  ({len(cc_td)} problems)\n{'='*60}")
 
     cc_total_prompts = sum(
@@ -327,6 +438,14 @@ def run_codecontests_testset_eval_steerable(
 
         steerer = steerer_factory(steer_mode)
         active_alpha = steer_value if steer_mode != "none" else 0.0
+        _eval_debug(
+            eval_debug,
+            "code_contests/steer_mode",
+            steer_mode=steer_mode,
+            steerer_cls=type(steerer).__name__,
+            active_alpha=active_alpha,
+            intervene_phase=getattr(steerer, "intervene_phase", None),
+        )
 
         print(f"\n[{steer_mode}] Generating code_contests solutions ...", flush=True)
         gen_start_t = time.perf_counter()
@@ -361,6 +480,7 @@ def run_codecontests_testset_eval_steerable(
                 zero_other_concepts=zero_other_concepts,
                 device=device,
                 use_cache=generate_use_cache,
+                eval_debug=eval_debug,
             )
             for meta, outs in zip(pending_meta, generated):
                 solution = outs[0]
@@ -382,6 +502,14 @@ def run_codecontests_testset_eval_steerable(
                 f"[eval-timing] code_contests/{steer_mode}: flush_generation="
                 f"{_fmt_seconds(time.perf_counter() - t0)} | batch={flush_size} | done={done}/{cc_total_prompts} | left={left}",
                 flush=True,
+            )
+            _eval_debug(
+                eval_debug,
+                "code_contests/flush",
+                steer_mode=steer_mode,
+                flush_batch=flush_size,
+                flush_wall_s=_fmt_seconds(time.perf_counter() - t0),
+                n_outputs=len(generated),
             )
 
         for i in tqdm(range(len(cc_td)), desc=f"cc/{steer_mode}", disable=not display):
@@ -484,6 +612,11 @@ def run_codecontests_testset_eval_steerable(
         del rows, concept_pred_rows, concept_target_rows
 
     print(f"[eval-timing] code_contests_all_total={_fmt_seconds(time.perf_counter() - eval_start_t)}", flush=True)
+    _eval_debug(
+        eval_debug,
+        "code_contests/all_total",
+        wall_s=_fmt_seconds(time.perf_counter() - eval_start_t),
+    )
     if test_dataset_holder is not None:
         test_dataset_holder[0] = None
     gc.collect()
@@ -523,6 +656,7 @@ def run_lcb_eval_steerable(
     extracted_preview_chars: int = 420,
     eval_log_host_memory: bool = False,
     generate_use_cache: bool = True,
+    eval_debug: bool = False,
 ) -> dict:
     """Steerer-agnostic LCB benchmark generation. Mirrors
     ``eval_metrics.run_livecodebench_benchmark_generation_for_cbm`` exactly in
@@ -561,6 +695,18 @@ def run_lcb_eval_steerable(
     print(f"[eval-timing] livecodebench: dataset_loading={_fmt_seconds(time.perf_counter() - t0)}", flush=True)
 
     device = next(llm.parameters()).device
+    _eval_debug(
+        eval_debug,
+        "lcb/init",
+        steer_modes=steer_modes,
+        batch_size=batch_size,
+        lcb_n_samples=lcb_n_samples,
+        n_problems=len(benchmark),
+        model_label=model_label,
+        layer_idx=layer_idx,
+        generate_use_cache=generate_use_cache,
+        device=str(device),
+    )
 
     for steer_mode in steer_modes:
         mode_repr = f"{model_label}-{steer_mode}"
@@ -572,6 +718,15 @@ def run_lcb_eval_steerable(
 
         steerer = steerer_factory(steer_mode)
         active_alpha = steer_value if steer_mode != "none" else 0.0
+        _eval_debug(
+            eval_debug,
+            "lcb/steer_mode",
+            steer_mode=steer_mode,
+            steerer_cls=type(steerer).__name__,
+            active_alpha=active_alpha,
+            n_problems=len(benchmark),
+            intervene_phase=getattr(steerer, "intervene_phase", None),
+        )
 
         print(f"\n[{steer_mode}] Generating {lcb_n_samples} × {len(benchmark)} LCB problems ...")
         gen_start_t = time.perf_counter()
@@ -606,6 +761,7 @@ def run_lcb_eval_steerable(
                 zero_other_concepts=zero_other_concepts,
                 device=device,
                 use_cache=generate_use_cache,
+                eval_debug=eval_debug,
             )
             for heading, raw_samples in zip(pending_headings, generated):
                 extracted = [_extract_code_from_output(s) for s in raw_samples]
@@ -624,6 +780,15 @@ def run_lcb_eval_steerable(
                 f"[eval-timing] livecodebench/{steer_mode}: flush_generation="
                 f"{_fmt_seconds(time.perf_counter() - t)} | batch={flush_size} | done={done}/{len(benchmark_sorted)} | left={left}",
                 flush=True,
+            )
+            _eval_debug(
+                eval_debug,
+                "lcb/flush",
+                steer_mode=steer_mode,
+                flush_batch=flush_size,
+                flush_wall_s=_fmt_seconds(time.perf_counter() - t),
+                n_problem_batches=len(generated),
+                n_samples_each=lcb_n_samples,
             )
 
         for problem in tqdm(benchmark_sorted, desc=f"lcb/{steer_mode}", disable=not display):
@@ -700,6 +865,11 @@ def run_lcb_eval_steerable(
         del save_results, all_outputs, all_extracted, benchmark_sorted
 
     print(f"[eval-timing] all_code_evaluations_total={_fmt_seconds(time.perf_counter() - eval_start_t)}", flush=True)
+    _eval_debug(
+        eval_debug,
+        "lcb/all_total",
+        wall_s=_fmt_seconds(time.perf_counter() - eval_start_t),
+    )
     del benchmark, load_code_generation_dataset, codegen_metrics, extract_instance_results
     gc.collect()
     if torch.cuda.is_available():

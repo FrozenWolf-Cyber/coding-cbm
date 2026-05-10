@@ -111,6 +111,14 @@ def parse_args():
         action="store_true",
         help="HF generate(use_cache=False) for code_contests + LCB (slow; ablation).",
     )
+    parser.add_argument(
+        "--eval_debug",
+        action="store_true",
+        help=(
+            "Verbose eval-only logs: tensor shapes, per-stage timings, steerer "
+            "class (VecAdd / PaCE / etc.). Does not affect training."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--max_length", type=int, default=1024)
@@ -286,6 +294,7 @@ def _run_method(
     debug_mode: bool,
     run_id: str,
     llamacpp_cache_dir: str,
+    eval_debug: bool,
 ):
     print(f"\n{'#'*72}\n# evaluating method: {method}\n{'#'*72}")
 
@@ -295,6 +304,20 @@ def _run_method(
         method, layer_idx=args.layer_idx, args=args,
         cf_concepts=concept_set, pace_cbm=pace_cbm,
     )
+    if eval_debug:
+        sm = [m.strip() for m in args.steer_modes.split(",") if m.strip()]
+        if method == "none":
+            probe_mode = "none"
+        else:
+            probe_mode = next((m for m in sm if m != "none"), sm[0] if sm else "groundtruth")
+        probe = factory(probe_mode)
+        print(
+            f"[eval-debug] cli/method_setup | method={method} | probe_mode={probe_mode!r} | "
+            f"intervene_phase={args.intervene_phase!r} | generate_use_cache={generate_use_cache} | "
+            f"probe_steerer={type(probe).__name__}",
+            flush=True,
+        )
+        del probe
 
     if method == "pace_cbm" and pace_cbm is not None:
         run_concept_accuracy_pace(
@@ -306,6 +329,7 @@ def _run_method(
             cf_size=pace_cbm.cf_size,
             device=device,
             test_similarity_np=test_similarity,
+            eval_debug=eval_debug,
         )
 
     # Concept-metric steerer always uses ``"all"``: it runs a single forward
@@ -351,6 +375,7 @@ def _run_method(
         cf_offset=cf_offset,
         cf_size=cf_size,
         generate_use_cache=generate_use_cache,
+        eval_debug=eval_debug,
     )
 
     cc_generations_by_mode: Dict[str, dict] = {}
@@ -383,6 +408,7 @@ def _run_method(
             extracted_preview_chars=args.extracted_preview_chars,
             eval_log_host_memory=bool(debug_mode or args.eval_log_host_memory),
             generate_use_cache=generate_use_cache,
+            eval_debug=eval_debug,
         )
 
     for mode, payload in cc_generations_by_mode.items():
@@ -431,6 +457,7 @@ def main():
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     debug_mode = bool(args.debug)
+    eval_debug = bool(args.eval_debug)
 
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     if not methods:
@@ -454,7 +481,10 @@ def main():
         run_id = f"debug-{int(time.time())}"
 
     print("loading code_contests test split for evaluation ...")
+    t_ds = time.perf_counter()
     raw_dataset = _hf_load_dataset_cache_first("deepmind/code_contests", dataset_cache_dir)
+    if eval_debug:
+        print(f"[eval-debug] cli/dataset | load_wall_s={time.perf_counter() - t_ds:.3f}s", flush=True)
     _, _, test_dataset = filter_codecontests(
         raw_dataset,
         cf_concept_lookup=CODEFORCES_CONCEPT_SET_LOOKUP,
@@ -476,11 +506,19 @@ def main():
     test_loader = build_loaders_param(test_dataset, test_dummy, "test", tokenizer, args)
 
     print("loading frozen LlamaForCausalLM ...")
+    t_lm = time.perf_counter()
     llm = LlamaForCausalLM.from_pretrained(
         LCB_LLAMA3_INSTRUCT_MODEL_ID,
         cache_dir=model_cache_dir,
         torch_dtype=torch.bfloat16,
     ).to(device)
+    if eval_debug:
+        p = next(llm.parameters())
+        print(
+            f"[eval-debug] cli/llm_loaded | wall_s={time.perf_counter() - t_lm:.3f}s | "
+            f"device={p.device} | dtype={p.dtype}",
+            flush=True,
+        )
     for p in llm.parameters():
         p.requires_grad = False
     llm.eval()
@@ -503,6 +541,7 @@ def main():
             debug_mode=debug_mode,
             run_id=str(run_id),
             llamacpp_cache_dir=llamacpp_cache_dir,
+            eval_debug=eval_debug,
         )
         if test_dataset_holder[0] is None:
             test_dataset_holder[0] = test_dataset
