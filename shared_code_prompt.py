@@ -1,9 +1,22 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 
 LCB_LLAMA3_INSTRUCT_MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
+
+
+def configure_code_eval_tokenizer(tokenizer: Any) -> None:
+    """Pad/eos alignment and BPE-friendly defaults for Llama code-eval paths.
+
+    - Ensures ``pad_token_id`` is set for batched ``generate``.
+    - Sets ``clean_up_tokenization_spaces=False`` so BPE decodes do not warn and
+      do not apply WordPiece-only cleanup.
+    """
+    if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if hasattr(tokenizer, "clean_up_tokenization_spaces"):
+        tokenizer.clean_up_tokenization_spaces = False
 
 _LCB_SYSTEM_PROMPT = (
     "You are an expert Python programmer. You will be given a question (problem specification) "

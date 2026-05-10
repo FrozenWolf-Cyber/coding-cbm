@@ -263,10 +263,14 @@ def _generate_with_steerer_batched(
     steerer.attach(llm)
     with steerer:
         t_gen = time.perf_counter()
-        gen_ids = llm.generate(
+        # Use ``max_length = prompt + new-token budget`` only. Passing
+        # ``max_new_tokens`` alongside the model default ``generation_config.max_length``
+        # makes Transformers warn that both are set.
+        total_max_length = int(input_ids.shape[1]) + int(max_new_tokens)
+        gen_kwargs = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
+            max_length=total_max_length,
             do_sample=temperature > 0.0,
             temperature=max(temperature, 1e-5),
             top_p=top_p,
@@ -274,13 +278,18 @@ def _generate_with_steerer_batched(
             repetition_penalty=repetition_penalty,
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
             use_cache=use_cache,
-        )  # (B_total, T_pad + T_new); B_total = B_prompt * n_samples
+        )
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_id is not None:
+            gen_kwargs["eos_token_id"] = eos_id
+        gen_ids = llm.generate(**gen_kwargs)  # (B_total, T_pad + T_new); B_total = B_prompt * n_samples
         _eval_debug(
             eval_debug,
             "generate/llm.generate",
             elapsed_s=_fmt_seconds(time.perf_counter() - t_gen),
             gen_ids=tuple(gen_ids.shape),
-            max_new_tokens=max_new_tokens,
+            total_max_length=total_max_length,
+            new_token_budget=max_new_tokens,
             temperature=temperature,
         )
 
@@ -291,7 +300,13 @@ def _generate_with_steerer_batched(
         base = i * n_samples
         for s in range(n_samples):
             completion = gen_ids[base + s, prompt_width:]  # (T_new,)
-            rows.append(tokenizer.decode(completion, skip_special_tokens=True).strip())
+            rows.append(
+                tokenizer.decode(
+                    completion,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                ).strip()
+            )
         outputs.append(rows)
     _eval_debug(
         eval_debug,

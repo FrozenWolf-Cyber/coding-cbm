@@ -230,7 +230,13 @@ def _generate_solutions(
     outputs = []
     for i in range(n_samples):
         completion = gen_ids[i, prompt_len:]
-        outputs.append(tokenizer.decode(completion, skip_special_tokens=True).strip())
+        outputs.append(
+            tokenizer.decode(
+                completion,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ).strip()
+        )
     return outputs
 
 
@@ -302,7 +308,13 @@ def _generate_solutions_batched(
         base_idx = i * n_samples
         for s_idx in range(n_samples):
             completion = gen_ids[base_idx + s_idx, prompt_width:]
-            row_outputs.append(tokenizer.decode(completion, skip_special_tokens=True).strip())
+            row_outputs.append(
+                tokenizer.decode(
+                    completion,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                ).strip()
+            )
         outputs.append(row_outputs)
     return outputs
 
@@ -1593,7 +1605,7 @@ def run_weight_analysis(cbl, concept_set, tokenizer):
                 print(
                     f"Neuron: {concept_set[i]} "
                     f"[{round(float(top_values.detach().cpu()[j]), 3)}] "
-                    f"{tokenizer.decode(top_ids[j])}"
+                    f"{tokenizer.decode(top_ids[j], clean_up_tokenization_spaces=False)}"
                 )
         sparsity = (w > 1e-6).count_nonzero() / w.numel()
     else:

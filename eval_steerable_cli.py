@@ -51,7 +51,7 @@ from eval_metrics import (
     run_rm_metrics_per_solution,
     set_seed,
 )
-from shared_code_prompt import LCB_LLAMA3_INSTRUCT_MODEL_ID
+from shared_code_prompt import LCB_LLAMA3_INSTRUCT_MODEL_ID, configure_code_eval_tokenizer
 
 from pace.data import (
     build_loaders_param,
@@ -501,7 +501,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         LCB_LLAMA3_INSTRUCT_MODEL_ID, cache_dir=model_cache_dir, use_fast=False,
     )
-    tokenizer.pad_token = tokenizer.eos_token
+    configure_code_eval_tokenizer(tokenizer)
     test_dummy = np.zeros((len(test_dataset), len(concept_set)), dtype=np.float32)
     test_loader = build_loaders_param(test_dataset, test_dummy, "test", tokenizer, args)
 

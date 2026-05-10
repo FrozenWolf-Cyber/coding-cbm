@@ -16,6 +16,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from shared_code_prompt import (
     LCB_LLAMA3_INSTRUCT_MODEL_ID,
+    configure_code_eval_tokenizer,
     format_lcb_llama3_instruct_prompt,
 )
 
@@ -155,7 +156,13 @@ def _generate_solutions_llama(
     outputs = []
     for i in range(n_samples):
         completion = gen_ids[i, prompt_len:]
-        outputs.append(tokenizer.decode(completion, skip_special_tokens=True).strip())
+        outputs.append(
+            tokenizer.decode(
+                completion,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ).strip()
+        )
     return outputs
 
 
@@ -207,7 +214,13 @@ def _generate_solutions_llama_batched(
         base = prompt_idx * n_samples
         for sample_idx in range(n_samples):
             completion = gen_ids[base + sample_idx, prompt_width:]
-            row.append(tokenizer.decode(completion, skip_special_tokens=True).strip())
+            row.append(
+                tokenizer.decode(
+                    completion,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                ).strip()
+            )
         batch_outputs.append(row)
     return batch_outputs
 
@@ -249,8 +262,7 @@ def generate_lcb_pickle(
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(LCB_LLAMA3_INSTRUCT_MODEL_ID)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    configure_code_eval_tokenizer(tokenizer)
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         LCB_LLAMA3_INSTRUCT_MODEL_ID,

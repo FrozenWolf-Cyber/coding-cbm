@@ -40,7 +40,9 @@ class TruthfulQAJudge:
         prompts = [self.true_template.format(question=q, answer=a) for q, a in zip(batch_prompts, batch_outputs)]
         inputs = self.true_tokenizer(prompts, padding=True, return_tensors="pt").to(self.true_judge.device)
         outs = self.true_judge.generate(**inputs, do_sample=False)
-        raw = self.true_tokenizer.batch_decode(outs, skip_special_tokens=True)
+        raw = self.true_tokenizer.batch_decode(
+            outs, skip_special_tokens=True, clean_up_tokenization_spaces=False,
+        )
         judgements = np.array([j[j.find("\nTrue: ") + len("\nTrue: "):] for j in raw])
         return np.where(judgements == "yes", 1, 0)
 
@@ -49,7 +51,9 @@ class TruthfulQAJudge:
         prompts = [self.info_template.format(question=q, answer=a) for q, a in zip(batch_prompts, batch_outputs)]
         inputs = self.info_tokenizer(prompts, padding=True, return_tensors="pt").to(self.info_judge.device)
         outs = self.info_judge.generate(**inputs, do_sample=False)
-        raw = self.info_tokenizer.batch_decode(outs, skip_special_tokens=True)
+        raw = self.info_tokenizer.batch_decode(
+            outs, skip_special_tokens=True, clean_up_tokenization_spaces=False,
+        )
         judgements = np.array([j[j.find("\nHelpful: ") + len("\nHelpful: "):] for j in raw])
         return np.where(judgements == "yes", 1, 0)
 

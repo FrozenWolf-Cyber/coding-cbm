@@ -50,7 +50,7 @@ from eval_metrics import (
     run_rm_metrics_per_solution,
     set_seed,
 )
-from shared_code_prompt import LCB_LLAMA3_INSTRUCT_MODEL_ID
+from shared_code_prompt import LCB_LLAMA3_INSTRUCT_MODEL_ID, configure_code_eval_tokenizer
 
 from pace.activations import collect_token_activations_at_layer
 from pace.data import (
@@ -272,7 +272,7 @@ def main():
         AutoTokenizer.from_pretrained, LCB_LLAMA3_INSTRUCT_MODEL_ID, model_cache_dir,
         use_fast=False,
     )
-    tokenizer.pad_token = tokenizer.eos_token
+    configure_code_eval_tokenizer(tokenizer)
 
     train_loader = build_loaders_param(train_dataset, train_similarity, "train", tokenizer, args)
     valid_loader = build_loaders_param(valid_dataset, val_similarity, "valid", tokenizer, args)

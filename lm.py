@@ -21,6 +21,7 @@ from transformers import (
 )
 
 from config import MODEL_NAMES, DEFAULT_CHAT_TEMPLATE, DEFAULT_GENERATION_KWARGS
+from shared_code_prompt import configure_code_eval_tokenizer
 from steer import get_steer_model
 from steer.pace import PaCESteerer
 
@@ -49,7 +50,7 @@ class HuggingFaceLM:
         self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(
             full_name, device_map=device, torch_dtype=self.dtype,
         )
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        configure_code_eval_tokenizer(self.tokenizer)
         self.tokenizer.padding_side = "left"
         self.model.config.pad_token_id = self.model.config.eos_token_id
 
@@ -104,7 +105,11 @@ class HuggingFaceLM:
             outputs = self.model.generate(**inputs, generation_config=generation_config)
 
         prompt_len = inputs.attention_mask.shape[1]
-        raw = self.tokenizer.batch_decode(outputs[:, prompt_len:], skip_special_tokens=True)
+        raw = self.tokenizer.batch_decode(
+            outputs[:, prompt_len:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
         return [r.split("\nQ:")[0] for r in raw]
 
     def chat(

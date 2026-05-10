@@ -39,6 +39,7 @@ from eval_metrics import (
 from shared_code_prompt import (
     LCB_LLAMA3_INSTRUCT_MODEL_ID,
     build_lcb_user_prompt,
+    configure_code_eval_tokenizer,
     format_lcb_llama3_instruct_prompt,
 )
 from config import CODEFORCES_CONCEPT_SET, CODEFORCES_CONCEPT_SET_LOOKUP
@@ -764,7 +765,7 @@ if __name__ == "__main__":
         model_cache_dir,
         use_fast=False,
     )
-    tokenizer.pad_token = tokenizer.eos_token
+    configure_code_eval_tokenizer(tokenizer)
 
     tokenization_elapsed = 0.0
 

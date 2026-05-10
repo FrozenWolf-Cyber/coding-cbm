@@ -33,7 +33,7 @@ from transformers import AutoTokenizer, LlamaForCausalLM
 
 from config import CODEFORCES_CONCEPT_SET, CODEFORCES_CONCEPT_SET_LOOKUP
 from eval_metrics import set_seed
-from shared_code_prompt import LCB_LLAMA3_INSTRUCT_MODEL_ID
+from shared_code_prompt import LCB_LLAMA3_INSTRUCT_MODEL_ID, configure_code_eval_tokenizer
 from steer import get_steer_model
 
 from pace.activations import (
@@ -160,7 +160,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         LCB_LLAMA3_INSTRUCT_MODEL_ID, cache_dir=model_cache_dir, use_fast=False,
     )
-    tokenizer.pad_token = tokenizer.eos_token
+    configure_code_eval_tokenizer(tokenizer)
 
     train_loader = build_loaders_param(
         train_dataset, train_similarity, "train", tokenizer, args, shuffle=False,
