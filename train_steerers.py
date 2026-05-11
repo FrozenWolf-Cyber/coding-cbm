@@ -56,7 +56,12 @@ SUPPORTED_METHODS = VECTOR_METHODS | TRANSFORM_METHODS
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--layer_idx", type=int, default=16)
-    parser.add_argument("--methods", type=str, default="CAA,ITI,RepE,LinAcT,MiMiC")
+    parser.add_argument(
+        "--methods",
+        type=str,
+        default="CAA,ITI,RepE,LinAcT,MiMiC",
+        help="Vector: CAA, ITI, RepE. Transform: LinAcT, MiMiC.",
+    )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--num_workers", type=int, default=0)

@@ -4,7 +4,8 @@ through the unified eval cascade.
 
 Each method is evaluated **on its own** — this is *not* a composition CLI.
 Pass the methods you want to compare with ``--methods`` and the script will
-dispatch a fresh ``HookSteerer`` per method, run the full cascade
+dispatch a fresh ``HookSteerer`` per method (including ``PaCE`` sparse
+dictionary decomposition on an anchor token; see ``pace.pace``), run the full cascade
 (concept-tag metrics + code_contests + LCB + perplexity + RM + llama.cpp
 judge), and persist generation lock files for offline LCB grading.
 
@@ -20,6 +21,12 @@ Examples
 - Vector steerers from a fitted ckpt directory:
     python eval_steerable_cli.py --methods CAA,ITI,RepE --layer_idx 16 \
         --vec_pack_root ./steer_ckpts
+
+- PaCE dictionary decomposition (loads **CAA** ``vec_pack.pt`` from the same
+  ``--vec_pack_root``; fit CAA first with ``train_steerers.py --methods CAA``).
+  Defaults: GPU lstsq when CUDA is available; reuse anchor coefficients across
+  decode steps. Opt out with ``--pace_decomp_cpu`` / ``--pace_decomp_no_reuse``:
+    python eval_steerable_cli.py --methods PaCE --layer_idx 16 --vec_pack_root ./steer_ckpts
 
 - Transform steerers:
     python eval_steerable_cli.py --methods LinAcT,MiMiC --layer_idx 16 \
@@ -75,17 +82,21 @@ from pace.hook_steerer import (
     TransformSteerer,
     VecAddSteerer,
 )
+from pace.pace import PaCEDecompSteerer
 from pace.pace_cbm import PaCECBM
 from train_pace_cbm import _hf_load_dataset_cache_first
 
 VECTOR_METHODS = {"CAA", "ITI", "RepE"}
+PACE_DECOMP_METHOD = "PaCE"
+# PaCE decomp steerer uses the same ``vec_pack.pt`` as CAA (fit with ``train_steerers --methods CAA``).
+PACE_DECOMP_VEC_SOURCE = "CAA"
 TRANSFORM_METHODS = {"LinAcT", "MiMiC"}
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--methods", type=str, default="none",
-                        help="Comma-separated: none, pace_cbm, CAA, ITI, RepE, LinAcT, MiMiC.")
+                        help="Comma-separated: none, pace_cbm, CAA, ITI, RepE, PaCE, LinAcT, MiMiC.")
     parser.add_argument("--layer_idx", type=int, default=16)
     parser.add_argument("--pace_ckpt", type=str, default="",
                         help="Path to pace_cbm_*.pt; required if 'pace_cbm' in --methods.")
@@ -113,6 +124,16 @@ def parse_args():
         "--eval_generate_no_kv_cache",
         action="store_true",
         help="HF generate(use_cache=False) for code_contests + LCB (slow; ablation).",
+    )
+    parser.add_argument(
+        "--pace_decomp_cpu",
+        action="store_true",
+        help="Force PaCE dictionary lstsq on CPU (default: GPU when CUDA is available).",
+    )
+    parser.add_argument(
+        "--pace_decomp_no_reuse",
+        action="store_true",
+        help="Re-run sparse decomposition every hook step (default: reuse anchor coeffs).",
     )
     parser.add_argument(
         "--eval_debug",
@@ -272,6 +293,24 @@ def _build_steerer_factory(
             if mode == "none":
                 return NoSteer(layer_idx=layer_idx)
             return PaCECBMSteerer(pace_cbm, intervene_phase=phase)
+        return _factory
+    if method == PACE_DECOMP_METHOD:
+        pack = _load_vec_pack(
+            PACE_DECOMP_VEC_SOURCE,
+            layer_idx=layer_idx,
+            vec_pack_root=args.vec_pack_root,
+        )
+        def _factory(mode: str) -> HookSteerer:
+            if mode == "none":
+                return NoSteer(layer_idx=layer_idx)
+            return PaCEDecompSteerer(
+                pack,
+                layer_idx=layer_idx,
+                method_name=method,
+                intervene_phase=phase,
+                use_gpu_lstsq=not bool(args.pace_decomp_cpu),
+                reuse_anchor_coeffs=not bool(args.pace_decomp_no_reuse),
+            )
         return _factory
     if method in VECTOR_METHODS:
         pack = _load_vec_pack(method, layer_idx=layer_idx, vec_pack_root=args.vec_pack_root)

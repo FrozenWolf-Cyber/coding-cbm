@@ -25,6 +25,7 @@ from .hook_steerer import (
     TransformSteerer,
     get_llama_layers,
 )
+from .pace import PaCEDecompSteerer
 
 __all__ = [
     "PaCECBM",
@@ -33,5 +34,6 @@ __all__ = [
     "PaCECBMSteerer",
     "VecAddSteerer",
     "TransformSteerer",
+    "PaCEDecompSteerer",
     "get_llama_layers",
 ]

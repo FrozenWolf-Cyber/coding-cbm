@@ -114,6 +114,23 @@ class HookSteerer(ABC):
         self.intervene_phase = intervene_phase
         self._handle = None
         self._payload: Optional[dict] = None
+        # Safety for generation-time batch expansion: by default we treat any
+        # mismatch between payload batch size and hook batch size as an error.
+        # Only allow repeating payload rows when the generation driver explicitly
+        # expanded the batch (e.g. repeat_interleave for num_return_sequences)
+        # and called the steerer payload expander.
+        self._allow_batch_repeat: bool = False
+        self._batch_repeat_factor: int = 1
+
+    def _mark_batch_repeat_allowed(self, n_samples: int) -> None:
+        """Allow batch repeating for expanded generation batches.
+
+        Called by each concrete steerer in its ``_expand_payload_for_n_samples``.
+        """
+        if n_samples is None or int(n_samples) <= 1:
+            return
+        self._allow_batch_repeat = True
+        self._batch_repeat_factor = int(n_samples)
 
     def _should_intervene_now(self, h_L: Tensor) -> bool:
         """Return False when the current forward should be passed through
@@ -145,6 +162,8 @@ class HookSteerer(ABC):
     # Optional: clear any stale per-batch payload between runs.
     def clear_payload(self) -> None:
         self._payload = None
+        self._allow_batch_repeat = False
+        self._batch_repeat_factor = 1
 
     @abstractmethod
     def _hook_fn(self, module, args, output):
@@ -223,6 +242,8 @@ class PaCECBMSteerer(HookSteerer):
         """
         if cf_multihot is None or cf_multihot.numel() == 0:
             self._payload = None
+            self._allow_batch_repeat = False
+            self._batch_repeat_factor = 1
             return
         if cf_multihot.dim() != 2 or cf_multihot.size(1) != self.pace_cbm.cf_size:
             raise ValueError(
@@ -247,6 +268,7 @@ class PaCECBMSteerer(HookSteerer):
         """Repeat the staged row mask along the batch dim."""
         if self._payload is None or n_samples <= 1:
             return
+        self._mark_batch_repeat_allowed(n_samples)
         rm = self._payload["row_mask"]
         self._payload["row_mask"] = rm.repeat_interleave(n_samples, dim=0)
 
@@ -271,14 +293,23 @@ class PaCECBMSteerer(HookSteerer):
             B_payload = row_mask.size(0)
             B_hL = h_L.size(0)
             if B_payload != B_hL:
-                # Generation may expand B by num_return_sequences — replicate.
-                if B_hL % B_payload == 0:
-                    factor = B_hL // B_payload
-                    row_mask = row_mask.repeat_interleave(factor, dim=0)
-                else:
+                if not self._allow_batch_repeat:
                     raise RuntimeError(
-                        f"PaCE hook batch mismatch: payload B={B_payload}, h_L B={B_hL}."
+                        "PaCECBMSteerer batch mismatch: payload row_mask was staged for "
+                        f"B_payload={B_payload} but hook received B={B_hL}. "
+                        "This usually means generation expanded the batch (e.g. "
+                        "repeat_interleave for num_return_sequences) without calling "
+                        "expand_payload_for_n_samples on the steerer. Refusing to "
+                        "silently repeat the payload."
                     )
+                expected = B_payload * int(self._batch_repeat_factor)
+                if expected != B_hL:
+                    raise RuntimeError(
+                        "PaCECBMSteerer batch mismatch under allowed repeat: "
+                        f"B_payload={B_payload} repeat_factor={self._batch_repeat_factor} "
+                        f"⇒ expected B={expected}, but got B={B_hL}."
+                    )
+                row_mask = row_mask.repeat_interleave(int(self._batch_repeat_factor), dim=0)
             row_mask = row_mask.to(h_L.device)
             value = payload["value"]
             zero_other = payload["zero_other"]
@@ -335,6 +366,8 @@ class VecAddSteerer(HookSteerer):
     ) -> None:
         if cf_multihot is None or cf_multihot.numel() == 0:
             self._payload = None
+            self._allow_batch_repeat = False
+            self._batch_repeat_factor = 1
             return
         if cf_multihot.dim() != 2 or cf_multihot.size(1) != self.C_cf:
             raise ValueError(
@@ -347,6 +380,7 @@ class VecAddSteerer(HookSteerer):
     def _expand_payload_for_n_samples(self, n_samples: int) -> None:
         if self._payload is None or n_samples <= 1:
             return
+        self._mark_batch_repeat_allowed(n_samples)
         av = self._payload["add_vec"]
         self._payload["add_vec"] = av.repeat_interleave(n_samples, dim=0)
 
@@ -359,12 +393,23 @@ class VecAddSteerer(HookSteerer):
             return output
         add_vec = payload["add_vec"]  # (B, H)
         if add_vec.size(0) != h_L.size(0):
-            if h_L.size(0) % add_vec.size(0) == 0:
-                add_vec = add_vec.repeat_interleave(h_L.size(0) // add_vec.size(0), dim=0)
-            else:
+            if not self._allow_batch_repeat:
                 raise RuntimeError(
-                    f"VecAdd hook batch mismatch: add_vec B={add_vec.size(0)}, h_L B={h_L.size(0)}."
+                    "VecAddSteerer batch mismatch: add_vec was staged for "
+                    f"B_payload={add_vec.size(0)} but hook received B={h_L.size(0)}. "
+                    "This usually means generation expanded the batch (e.g. "
+                    "repeat_interleave for num_return_sequences) without calling "
+                    "expand_payload_for_n_samples on the steerer. Refusing to "
+                    "silently repeat the payload."
                 )
+            expected = add_vec.size(0) * int(self._batch_repeat_factor)
+            if expected != h_L.size(0):
+                raise RuntimeError(
+                    "VecAddSteerer batch mismatch under allowed repeat: "
+                    f"B_payload={add_vec.size(0)} repeat_factor={self._batch_repeat_factor} "
+                    f"⇒ expected B={expected}, but got B={h_L.size(0)}."
+                )
+            add_vec = add_vec.repeat_interleave(int(self._batch_repeat_factor), dim=0)
         add_vec_b = add_vec.to(device=h_L.device, dtype=h_L.dtype).unsqueeze(1)  # (B, 1, H)
         z_ctrl = h_L + add_vec_b  # (B, T, H) + broadcast (B, 1, H) -> (B, T, H)
         if isinstance(output, tuple):
@@ -414,9 +459,13 @@ class TransformSteerer(HookSteerer):
         """
         if per_row_idx is not None:
             self._payload = {"per_row_idx": list(per_row_idx)}
+            self._allow_batch_repeat = False
+            self._batch_repeat_factor = 1
             return
         if cf_multihot is None or cf_multihot.numel() == 0:
             self._payload = None
+            self._allow_batch_repeat = False
+            self._batch_repeat_factor = 1
             return
         idx_list: List[int] = []
         for row in cf_multihot:
@@ -427,6 +476,7 @@ class TransformSteerer(HookSteerer):
     def _expand_payload_for_n_samples(self, n_samples: int) -> None:
         if self._payload is None or n_samples <= 1:
             return
+        self._mark_batch_repeat_allowed(n_samples)
         idx = self._payload["per_row_idx"]
         expanded: List[int] = []
         for i in idx:
@@ -442,13 +492,23 @@ class TransformSteerer(HookSteerer):
             return output
         per_row_idx = payload["per_row_idx"]  # length B (after expansion matches B_hL)
         if len(per_row_idx) != h_L.size(0):
-            if h_L.size(0) % len(per_row_idx) == 0:
-                factor = h_L.size(0) // len(per_row_idx)
-                per_row_idx = [i for i in per_row_idx for _ in range(factor)]
-            else:
+            if not self._allow_batch_repeat:
                 raise RuntimeError(
-                    f"Transform hook batch mismatch: idx B={len(per_row_idx)}, h_L B={h_L.size(0)}."
+                    "TransformSteerer batch mismatch: per_row_idx was staged for "
+                    f"B_payload={len(per_row_idx)} but hook received B={h_L.size(0)}. "
+                    "This usually means generation expanded the batch (e.g. "
+                    "repeat_interleave for num_return_sequences) without calling "
+                    "expand_payload_for_n_samples on the steerer. Refusing to "
+                    "silently repeat the payload."
                 )
+            expected = len(per_row_idx) * int(self._batch_repeat_factor)
+            if expected != h_L.size(0):
+                raise RuntimeError(
+                    "TransformSteerer batch mismatch under allowed repeat: "
+                    f"B_payload={len(per_row_idx)} repeat_factor={self._batch_repeat_factor} "
+                    f"⇒ expected B={expected}, but got B={h_L.size(0)}."
+                )
+            per_row_idx = [i for i in per_row_idx for _ in range(int(self._batch_repeat_factor))]
 
         original_dtype = h_L.dtype
         z_ctrl = h_L.clone()  # (B, T, H)

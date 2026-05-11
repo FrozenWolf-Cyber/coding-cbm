@@ -25,6 +25,7 @@ from .hook_steerer import (
     TransformSteerer,
     VecAddSteerer,
 )
+from .pace import PaCEDecompSteerer
 
 
 def cf_tags_to_multihot(
@@ -80,6 +81,13 @@ def configure_steerer(
         return
     if isinstance(steerer, VecAddSteerer):
         steerer.configure_for_batch(cf_multihot=cf_multihot, alpha=alpha)
+        return
+    if isinstance(steerer, PaCEDecompSteerer):
+        steerer.configure_for_batch(
+            cf_multihot=cf_multihot,
+            alpha=alpha,
+            zero_other_concepts=zero_other_concepts,
+        )
         return
     if isinstance(steerer, TransformSteerer):
         steerer.configure_for_batch(cf_multihot=cf_multihot)
