@@ -172,6 +172,9 @@ def parse_args():
     parser.add_argument("--lcb_max_new_tokens", type=int, default=2000)
     parser.add_argument("--print_extracted_code_preview", action="store_true")
     parser.add_argument("--extracted_preview_chars", type=int, default=420)
+    parser.add_argument("--print_each_solution", action="store_true")
+    parser.add_argument("--each_solution_question_chars", type=int, default=0)
+    parser.add_argument("--each_solution_code_chars", type=int, default=0)
     parser.add_argument("--eval_log_host_memory", action="store_true")
     parser.add_argument("--rm_model_name", type=str, default="Skywork/Skywork-Reward-V2-Llama-3.1-8B")
     parser.add_argument("--rm_batch_size", type=int, default=0)
@@ -491,6 +494,9 @@ def main():
         zero_other_concepts=args.zero_other_concepts,
         print_extracted_code_preview=args.print_extracted_code_preview,
         extracted_preview_chars=args.extracted_preview_chars,
+        print_each_solution=args.print_each_solution,
+        each_solution_question_chars=args.each_solution_question_chars,
+        each_solution_code_chars=args.each_solution_code_chars,
         eval_log_host_memory=bool(debug_mode or args.eval_log_host_memory),
         # Concept-metric steerer must use ``"all"`` because it runs a single
         # forward over the *prompt* (not generation) and must fire the hook
@@ -529,6 +535,9 @@ def main():
         lcb_max_new_tokens=args.lcb_max_new_tokens,
         print_extracted_code_preview=args.print_extracted_code_preview,
         extracted_preview_chars=args.extracted_preview_chars,
+        print_each_solution=args.print_each_solution,
+        each_solution_question_chars=args.each_solution_question_chars,
+        each_solution_code_chars=args.each_solution_code_chars,
         eval_log_host_memory=bool(debug_mode or args.eval_log_host_memory),
         generate_use_cache=generate_use_cache,
         eval_debug=bool(args.eval_debug),

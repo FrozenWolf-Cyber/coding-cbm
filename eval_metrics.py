@@ -354,6 +354,33 @@ def print_extracted_code_samples_preview(
             print(f"  [sample {j + 1}/{len(extracted_codes)}] extracted (start):\n{indented}")
 
 
+def print_solution_question_and_extracted_code(
+    *,
+    heading: str,
+    question: str,
+    extracted_codes: Sequence[str],
+    question_max_chars: int = 0,
+    code_max_chars: int = 0,
+    sep_width: int = 72,
+) -> None:
+    """Print full (or capped) problem statement and extracted code for CLI inspection."""
+    sep = "=" * sep_width
+    print(f"\n{sep}\n{heading}\n{sep}", flush=True)
+    q = (question or "").strip()
+    if question_max_chars > 0 and len(q) > question_max_chars:
+        q = q[:question_max_chars] + "\n... [question truncated]"
+    print("--- QUESTION ---", flush=True)
+    print(q if q else "(empty)", flush=True)
+    print("--- EXTRACTED CODE ---", flush=True)
+    for j, code in enumerate(extracted_codes):
+        body = (code or "").strip()
+        if code_max_chars > 0 and len(body) > code_max_chars:
+            body = body[:code_max_chars] + "\n... [code truncated]"
+        if len(extracted_codes) > 1:
+            print(f"[sample {j + 1}/{len(extracted_codes)}]", flush=True)
+        print(body if body else "(empty)", flush=True)
+
+
 # ── LCB import helper ─────────────────────────────────────────────────────────
 
 def _import_lcb():

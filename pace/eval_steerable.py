@@ -35,6 +35,7 @@ from eval_metrics import (
     _import_lcb,
     _memory_checkpoint,
     print_extracted_code_samples_preview,
+    print_solution_question_and_extracted_code,
     safe_wandb_log,
     set_seed,
 )
@@ -376,6 +377,9 @@ def run_codecontests_testset_eval_steerable(
     zero_other_concepts: bool = False,
     print_extracted_code_preview: bool = False,
     extracted_preview_chars: int = 420,
+    print_each_solution: bool = False,
+    each_solution_question_chars: int = 0,
+    each_solution_code_chars: int = 0,
     eval_log_host_memory: bool = False,
     pace_steerer_for_concept_metrics: Optional[PaCECBMSteerer] = None,
     cf_offset: int = 0,
@@ -472,6 +476,7 @@ def run_codecontests_testset_eval_steerable(
         pending_prompts: List[str] = []
         pending_cf_tags: List[List[str]] = []
         pending_meta: List[dict] = []
+        pending_descriptions: List[str] = []
 
         def _flush():
             if not pending_prompts:
@@ -497,10 +502,21 @@ def run_codecontests_testset_eval_steerable(
                 use_cache=generate_use_cache,
                 eval_debug=eval_debug,
             )
-            for meta, outs in zip(pending_meta, generated):
+            for meta, outs, desc_full in zip(pending_meta, generated, pending_descriptions):
                 solution = outs[0]
                 extracted = _extract_code_from_output(solution)
                 rows.append({**meta, "raw_output": solution, "extracted_code": extracted})
+                if print_each_solution:
+                    print_solution_question_and_extracted_code(
+                        heading=(
+                            f"[{steer_mode}] code_contests | "
+                            f"problem={meta.get('problem_name', '?')!r}"
+                        ),
+                        question=desc_full,
+                        extracted_codes=[extracted],
+                        question_max_chars=each_solution_question_chars,
+                        code_max_chars=each_solution_code_chars,
+                    )
                 if print_extracted_code_preview:
                     print_extracted_code_samples_preview(
                         f"[{steer_mode}] code_contests problem={meta.get('problem_name','?')!r} "
@@ -511,6 +527,7 @@ def run_codecontests_testset_eval_steerable(
             pending_prompts.clear()
             pending_cf_tags.clear()
             pending_meta.clear()
+            pending_descriptions.clear()
             done = len(rows)
             left = max(0, cc_total_prompts - done)
             print(
@@ -556,6 +573,7 @@ def run_codecontests_testset_eval_steerable(
 
             pending_prompts.append(prompt)
             pending_cf_tags.append(cf_tags)
+            pending_descriptions.append(description)
             pending_meta.append({
                 "problem_name": problem.get("name", f"problem_{i}"),
                 "description_preview": description[:300],
@@ -669,6 +687,9 @@ def run_lcb_eval_steerable(
     lcb_repetition_penalty: float = 1.05,
     print_extracted_code_preview: bool = False,
     extracted_preview_chars: int = 420,
+    print_each_solution: bool = False,
+    each_solution_question_chars: int = 0,
+    each_solution_code_chars: int = 0,
     eval_log_host_memory: bool = False,
     generate_use_cache: bool = True,
     eval_debug: bool = False,
@@ -753,6 +774,8 @@ def run_lcb_eval_steerable(
         pending_prompts: List[str] = []
         pending_cf_tags: List[List[str]] = []
         pending_headings: List[str] = []
+        pending_lcb_questions: List[str] = []
+        pending_lcb_ids: List[str] = []
 
         def _flush():
             if not pending_prompts:
@@ -778,8 +801,18 @@ def run_lcb_eval_steerable(
                 use_cache=generate_use_cache,
                 eval_debug=eval_debug,
             )
-            for heading, raw_samples in zip(pending_headings, generated):
+            for heading, raw_samples, q_body, q_id in zip(
+                pending_headings, generated, pending_lcb_questions, pending_lcb_ids,
+            ):
                 extracted = [_extract_code_from_output(s) for s in raw_samples]
+                if print_each_solution:
+                    print_solution_question_and_extracted_code(
+                        heading=f"[{steer_mode}] LCB | question_id={q_id}",
+                        question=q_body,
+                        extracted_codes=extracted,
+                        question_max_chars=each_solution_question_chars,
+                        code_max_chars=each_solution_code_chars,
+                    )
                 if print_extracted_code_preview:
                     print_extracted_code_samples_preview(
                         heading, extracted, preview_chars=extracted_preview_chars,
@@ -789,6 +822,8 @@ def run_lcb_eval_steerable(
             pending_prompts.clear()
             pending_cf_tags.clear()
             pending_headings.clear()
+            pending_lcb_questions.clear()
+            pending_lcb_ids.clear()
             done = len(all_outputs)
             left = max(0, len(benchmark_sorted) - done)
             print(
@@ -822,6 +857,8 @@ def run_lcb_eval_steerable(
             )
             pending_prompts.append(prompt)
             pending_cf_tags.append(cf_tags)
+            pending_lcb_questions.append(problem.question_content or "")
+            pending_lcb_ids.append(problem_id)
             desc_flat = problem.question_content.replace("\n", " ").strip()
             desc_short = desc_flat[:260] + ("..." if len(desc_flat) > 260 else "")
             pending_headings.append(

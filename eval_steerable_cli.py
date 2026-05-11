@@ -24,6 +24,9 @@ Examples
 - Transform steerers:
     python eval_steerable_cli.py --methods LinAcT,MiMiC --layer_idx 16 \
         --transform_root ./steer_ckpts
+
+- Log every problem and extracted code (verbose):
+    python eval_steerable_cli.py --methods none --print_each_solution
 """
 
 from __future__ import annotations
@@ -141,6 +144,26 @@ def parse_args():
     parser.add_argument("--lcb_max_new_tokens", type=int, default=2000)
     parser.add_argument("--print_extracted_code_preview", action="store_true")
     parser.add_argument("--extracted_preview_chars", type=int, default=420)
+    parser.add_argument(
+        "--print_each_solution",
+        action="store_true",
+        help=(
+            "After each code_contests / LCB generation, print the full problem text "
+            "and extracted code (use --each_solution_*_chars to cap length)."
+        ),
+    )
+    parser.add_argument(
+        "--each_solution_question_chars",
+        type=int,
+        default=0,
+        help="Max question chars when printing each solution; 0 = no truncation.",
+    )
+    parser.add_argument(
+        "--each_solution_code_chars",
+        type=int,
+        default=0,
+        help="Max extracted-code chars when printing each solution; 0 = no truncation.",
+    )
     parser.add_argument("--eval_log_host_memory", action="store_true")
     parser.add_argument("--rm_model_name", type=str, default="Skywork/Skywork-Reward-V2-Llama-3.1-8B")
     parser.add_argument("--rm_batch_size", type=int, default=0)
@@ -370,6 +393,9 @@ def _run_method(
         zero_other_concepts=args.zero_other_concepts,
         print_extracted_code_preview=args.print_extracted_code_preview,
         extracted_preview_chars=args.extracted_preview_chars,
+        print_each_solution=args.print_each_solution,
+        each_solution_question_chars=args.each_solution_question_chars,
+        each_solution_code_chars=args.each_solution_code_chars,
         eval_log_host_memory=bool(debug_mode or args.eval_log_host_memory),
         pace_steerer_for_concept_metrics=pace_for_metrics,
         cf_offset=cf_offset,
@@ -406,6 +432,9 @@ def _run_method(
             lcb_max_new_tokens=args.lcb_max_new_tokens,
             print_extracted_code_preview=args.print_extracted_code_preview,
             extracted_preview_chars=args.extracted_preview_chars,
+            print_each_solution=args.print_each_solution,
+            each_solution_question_chars=args.each_solution_question_chars,
+            each_solution_code_chars=args.each_solution_code_chars,
             eval_log_host_memory=bool(debug_mode or args.eval_log_host_memory),
             generate_use_cache=generate_use_cache,
             eval_debug=eval_debug,
