@@ -418,7 +418,7 @@ class VecAddSteerer(HookSteerer):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TransformSteerer — wraps a per-tag ``Steer`` instance (LinAcT / MiMiC).
+# TransformSteerer — wraps a per-tag ``Steer`` instance (LinAcT / MiMiC / ODESteer / …).
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TransformSteerer(HookSteerer):
@@ -428,7 +428,7 @@ class TransformSteerer(HookSteerer):
     selects a single tag index per row (e.g. the first ground-truth tag);
     rows whose ``selected_idx`` is ``-1`` are passed through unchanged.
 
-    LinAcT/MiMiC don't compose linearly across multiple per-tag affine maps,
+    Per-tag steerers (LinAcT, MiMiC, ODESteer, …) don't compose linearly across multiple maps,
     so we deliberately apply a single tag per row instead of an arbitrary mix.
     """
 

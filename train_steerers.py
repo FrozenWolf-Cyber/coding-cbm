@@ -1,12 +1,12 @@
 """Fit per-CF-tag vector / transform steerers from ``steer/`` and persist them.
 
-For each ``--method`` (CAA / ITI / RepE / LinAcT / MiMiC) and each CF tag in
+For each ``--method`` (CAA / ITI / RepE / LinAcT / MiMiC / ODESteer / …) and each CF tag in
 ``CODEFORCES_CONCEPT_SET``:
 
   1. Collect EOS-pooled hidden states at ``--layer_idx`` over the train split.
   2. ``pos_X = acts[label_c == 1]``, ``neg_X = acts[label_c == 0]``.
-  3. ``steerer = get_steer_model(method).fit(pos_X, neg_X)``.
-  4. Save to ``steer_ckpts/{method}/layer{L}/{tag}.pt``.
+  3. ``steerer = get_steer_model(method, **STEER_DEFAULT_KWARGS.get(method, {})).fit(pos_X, neg_X)``.
+  4. Save to ``steer_ckpts/{method}/layer{L}/vec_pack.pt`` (vectors) or ``{tag}.pkl`` (transform / ODE).
 
 This is purely "fit + persist" — no training loop, no LM forward beyond the
 single activation-collection pass that's reused across every tag and method
@@ -14,7 +14,7 @@ single activation-collection pass that's reused across every tag and method
 
 Vector steerers (``CAA``/``ITI``/``RepE``) get stacked into a single
 ``(C_cf, H)`` tensor for fast batched ``VecAddSteerer`` runs at eval time;
-transform steerers (``LinAcT``/``MiMiC``) are pickled per tag.
+transform / ODE steerers (``LinAcT``/``MiMiC``/``ODESteer``/…) are pickled per tag.
 """
 
 from __future__ import annotations
@@ -31,7 +31,11 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, LlamaForCausalLM
 
-from config import CODEFORCES_CONCEPT_SET, CODEFORCES_CONCEPT_SET_LOOKUP
+from config import (
+    CODEFORCES_CONCEPT_SET,
+    CODEFORCES_CONCEPT_SET_LOOKUP,
+    STEER_DEFAULT_KWARGS,
+)
 from eval_metrics import set_seed
 from shared_code_prompt import LCB_LLAMA3_INSTRUCT_MODEL_ID, configure_code_eval_tokenizer
 from steer import get_steer_model
@@ -50,7 +54,9 @@ from train_pace_cbm import _hf_load_dataset_cache_first  # cache-first loader
 
 VECTOR_METHODS = {"CAA", "ITI", "RepE"}
 TRANSFORM_METHODS = {"LinAcT", "MiMiC"}
-SUPPORTED_METHODS = VECTOR_METHODS | TRANSFORM_METHODS
+# Same per-tag pickle + eval-time ``TransformSteerer`` path as LinAcT/MiMiC.
+ODE_HOOK_METHODS = {"ODESteer", "RFFODESteer", "StepODESteer", "RFFStepODESteer"}
+SUPPORTED_METHODS = VECTOR_METHODS | TRANSFORM_METHODS | ODE_HOOK_METHODS
 
 
 def parse_args():
@@ -60,7 +66,7 @@ def parse_args():
         "--methods",
         type=str,
         default="CAA,ITI,RepE,LinAcT,MiMiC",
-        help="Vector: CAA, ITI, RepE. Transform: LinAcT, MiMiC.",
+        help="Vector: CAA, ITI, RepE. Transform: LinAcT, MiMiC. ODE: ODESteer, RFFODESteer, StepODESteer, RFFStepODESteer.",
     )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_length", type=int, default=1024)
@@ -229,11 +235,13 @@ def main():
             if pos_X.size(0) == 0 or neg_X.size(0) == 0:
                 skipped_count += 1
                 continue
-            steerer = get_steer_model(method)
+            steer_kwargs = dict(STEER_DEFAULT_KWARGS.get(method, {}))
+            steerer = get_steer_model(method, **steer_kwargs)
             steerer.fit(pos_X, neg_X)
             if method in VECTOR_METHODS:
                 fitted_vec[tag] = steerer
             else:
+                # LinAcT / MiMiC / ODE* — one fitted ``Steer`` pickle per CF tag.
                 _save_transform_per_tag(
                     method=method,
                     layer_idx=args.layer_idx,

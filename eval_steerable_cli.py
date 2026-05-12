@@ -1,5 +1,5 @@
 """Single entrypoint that evaluates the steerability of any chosen method
-(``none`` baseline, PaCE-CBM checkpoint, vector steerers, transform steerers)
+(``none`` baseline, PaCE-CBM checkpoint, vector steerers, transform / ODE steerers)
 through the unified eval cascade.
 
 Each method is evaluated **on its own** — this is *not* a composition CLI.
@@ -31,6 +31,11 @@ Examples
 - Transform steerers:
     python eval_steerable_cli.py --methods LinAcT,MiMiC --layer_idx 16 \
         --transform_root ./steer_ckpts
+
+- ODE / step-ODE steerers (same per-tag ``{tag}.pkl`` layout as LinAcT; fit with
+  ``train_steerers.py --methods ODESteer``):
+    python eval_steerable_cli.py --methods ODESteer --layer_idx 16 \
+        --transform_root ./steer_ckpts --steer_value 5.0
 
 - Log every problem and extracted code (verbose):
     python eval_steerable_cli.py --methods none --print_each_solution
@@ -91,21 +96,26 @@ PACE_DECOMP_METHOD = "PaCE"
 # PaCE decomp steerer uses the same ``vec_pack.pt`` as CAA (fit with ``train_steerers --methods CAA``).
 PACE_DECOMP_VEC_SOURCE = "CAA"
 TRANSFORM_METHODS = {"LinAcT", "MiMiC"}
+# Per-tag pickles under ``--transform_root`` (same as LinAcT); fitted via ``train_steerers.py``.
+ODE_HOOK_METHODS = {"ODESteer", "RFFODESteer", "StepODESteer", "RFFStepODESteer"}
+TRANSFORM_STYLE_METHODS = TRANSFORM_METHODS | ODE_HOOK_METHODS
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--methods", type=str, default="none",
-                        help="Comma-separated: none, pace_cbm, CAA, ITI, RepE, PaCE, LinAcT, MiMiC.")
+                        help="Comma-separated: none, pace_cbm, CAA, ITI, RepE, PaCE, LinAcT, MiMiC, "
+                             "ODESteer, RFFODESteer, StepODESteer, RFFStepODESteer.")
     parser.add_argument("--layer_idx", type=int, default=16)
     parser.add_argument("--pace_ckpt", type=str, default="",
                         help="Path to pace_cbm_*.pt; required if 'pace_cbm' in --methods.")
     parser.add_argument("--vec_pack_root", type=str, default="./steer_ckpts",
                         help="Root containing {METHOD}/layer{L}/vec_pack.pt (CAA / ITI / RepE).")
     parser.add_argument("--transform_root", type=str, default="./steer_ckpts",
-                        help="Root containing {METHOD}/layer{L}/{tag}.pkl (LinAcT / MiMiC).")
+                        help="Root containing {METHOD}/layer{L}/{tag}.pkl (LinAcT / MiMiC / ODE*).")
     parser.add_argument("--steer_value", type=float, default=1.0,
-                        help="Magnitude scale per steerer (CAA/ITI/RepE α; PaCE-CBM intervene_value).")
+                        help="Magnitude scale per steerer (CAA/ITI/RepE α; PaCE-CBM intervene_value; "
+                             "ODE / LinAcT / MiMiC flow strength T passed to ``Steer.steer(..., T=…)``).")
     parser.add_argument("--zero_other_concepts", action="store_true")
     parser.add_argument("--steer_modes", type=str, default="none,groundtruth")
     parser.add_argument(
@@ -250,7 +260,7 @@ def _load_transform_per_tag(method: str, *, layer_idx: int, transform_root: str,
     method_dir = Path(transform_root) / method / f"layer{layer_idx}"
     if not method_dir.is_dir():
         raise FileNotFoundError(
-            f"{method} transform dir missing at {method_dir}; run train_steerers.py first."
+            f"{method} transform/ODE steer dir missing at {method_dir}; run train_steerers.py first."
         )
     out = []
     for tag in cf_concepts:
@@ -321,7 +331,7 @@ def _build_steerer_factory(
                 pack, layer_idx=layer_idx, method_name=method, intervene_phase=phase,
             )
         return _factory
-    if method in TRANSFORM_METHODS:
+    if method in TRANSFORM_STYLE_METHODS:
         steerers = _load_transform_per_tag(
             method, layer_idx=layer_idx,
             transform_root=args.transform_root, cf_concepts=cf_concepts,

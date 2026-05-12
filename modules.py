@@ -50,9 +50,22 @@ def _bottleneck_forward_tail(llama_model, h_L_out, attention_mask, layer_idx):
         position_ids = position_ids.masked_fill(attention_mask == 0, 1)
     else:
         position_ids = cache_position.unsqueeze(0).expand(bsz, -1)
-    causal_mask = llama_model._update_causal_mask(
-        attention_mask, h_L_out, cache_position, None, False,
-    )
+    # HF >= ~4.46: `_update_causal_mask` removed from `LlamaModel`; use `create_causal_mask` instead.
+    if hasattr(llama_model, "_update_causal_mask"):
+        causal_mask = llama_model._update_causal_mask(
+            attention_mask, h_L_out, cache_position, None, False,
+        )
+    else:
+        from transformers.masking_utils import create_causal_mask
+
+        causal_mask = create_causal_mask(
+            config=llama_model.config,
+            input_embeds=h_L_out,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=None,
+            position_ids=position_ids,
+        )
     position_embeddings = llama_model.rotary_emb(h_L_out, position_ids)
     h = h_L_out
     for layer in llama_model.layers[layer_idx + 1:]:

@@ -1,5 +1,5 @@
 """Steerer-agnostic evaluation cascade for PaCE-CBM and the vector / transform
-steerers (CAA / ITI / RepE / LinAcT / MiMiC), plus the no-steer baseline.
+/ ODE steerers (CAA / ITI / RepE / LinAcT / MiMiC / ODESteer / …), plus the no-steer baseline.
 
 Reuses every helper from ``eval_metrics`` it can; the only new piece is
 ``_generate_with_steerer_batched`` which calls
